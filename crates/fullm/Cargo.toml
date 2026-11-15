@@ -1,0 +1,42 @@
+[package]
+name = "fullm"
+description = "A single-GPU LLM inference engine: OpenAI-compatible serving for Qwen3 and Kimi models"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[features]
+default = []
+cuda = ["fullm-kernels/cuda"]
+torch = ["fullm-kernels/torch"]
+cutlass = ["cuda", "fullm-kernels/cutlass"]
+
+[dependencies]
+fullm-kernels = { path = "../fullm-kernels" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+memmap2.workspace = true
+rayon.workspace = true
+half.workspace = true
+clap.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+axum.workspace = true
+futures.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+base64.workspace = true
+fancy-regex.workspace = true
+libc.workspace = true
+llguidance = "1.9"
+minijinja = { version = "3.1.0", features = ["preserve_order", "loop_controls", "json", "serde"] }
+minijinja-contrib = { version = "3.1.0", features = ["pycompat"] }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+
+[[bin]]
+name = "fullm"
+path = "src/main.rs"

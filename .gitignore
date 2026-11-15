@@ -1,0 +1,14 @@
+/target/
+**/*.rs.bk
+__pycache__/
+*.pyc
+.DS_Store
+# editors
+.idea/
+.vscode/
+# large local artifacts: checkpoints, packed trunks, bench output
+/models/
+/out/
+
+# design notes and measurements, kept locally
+/docs/

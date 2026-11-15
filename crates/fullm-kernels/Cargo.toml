@@ -1,0 +1,25 @@
+[package]
+name = "fullm-kernels"
+description = "C++ CPU and CUDA kernels for fullm, behind a C ABI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+links = "fullm_kernels"
+build = "build.rs"
+
+[features]
+default = []
+# Compile csrc/exec/cuda with nvcc and link the CUDA runtime, cuBLASLt and the driver API.
+cuda = []
+# The torch backend: GEMMs through libtorch (FULLM_TORCH_DIR = a Python torch package).
+torch = []
+# CUTLASS (header-only, FULLM_CUTLASS_DIR) sm90 kernels for the prefill experts; implies cuda.
+cutlass = ["cuda"]
+
+[dependencies]
+libc.workspace = true
+
+[build-dependencies]
+cc.workspace = true

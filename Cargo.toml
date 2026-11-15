@@ -1,0 +1,41 @@
+[workspace]
+resolver = "2"
+members = ["crates/fullm-kernels", "crates/fullm"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+rust-version = "1.87"
+repository = "https://github.com/weiwang217/FuLLM"
+homepage = "https://github.com/weiwang217/FuLLM"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+memmap2 = "0.9"
+rayon = "1.10"
+half = "2"
+clap = { version = "4", features = ["derive"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "net", "signal"] }
+tokio-stream = "0.1"
+axum = "0.8"
+futures = "0.3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+base64 = "0.22"
+fancy-regex = "0.14"
+libc = "0.2"
+cc = "1"
+
+# The engine's tests run real forward passes; unoptimised they are needlessly slow.
+[profile.dev]
+opt-level = 2
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"

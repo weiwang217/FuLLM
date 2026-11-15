@@ -1,0 +1,89 @@
+FuLLM
+Copyright 2026 Wei Wang
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE). It includes or
+adapts the third-party work below, under the licenses given.
+
+1. FlashAttention-3 (forward pass, Hopper), vendored in
+   crates/fullm-kernels/csrc/exec/cuda/fa3/ with local changes described in its README.md.
+   https://github.com/Dao-AILab/flash-attention, BSD-3-Clause; its license is in
+   crates/fullm-kernels/csrc/exec/cuda/fa3/LICENSE.
+
+2. tiktoken: the BPE merge loop in crates/fullm/src/tokenizer.rs (byte_pair_merge_scan) is a
+   port of tiktoken's _byte_pair_merge. https://github.com/openai/tiktoken, MIT License:
+
+   MIT License
+   
+   Copyright (c) 2022 OpenAI, Shantanu Jain
+   
+   Permission is hereby granted, free of charge, to any person obtaining a copy
+   of this software and associated documentation files (the "Software"), to deal
+   in the Software without restriction, including without limitation the rights
+   to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+   copies of the Software, and to permit persons to whom the Software is
+   furnished to do so, subject to the following conditions:
+   
+   The above copyright notice and this permission notice shall be included in all
+   copies or substantial portions of the Software.
+   
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+   FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+   AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+   LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+   OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+   SOFTWARE.
+
+3. CUTLASS: built against, not vendored (FULLM_CUTLASS_DIR). EndCausalFusion in
+   crates/fullm-kernels/csrc/exec/cuda/cutlass_ops.cu is adapted from the CausalFusion of its
+   example 88 (Hopper FMHA). https://github.com/NVIDIA/cutlass, BSD-3-Clause:
+
+   Copyright (c) 2017 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+   SPDX-License-Identifier: BSD-3-Clause
+   
+   Redistribution and use in source and binary forms, with or without
+   modification, are permitted provided that the following conditions are met:
+   
+   1. Redistributions of source code must retain the above copyright notice, this
+   list of conditions and the following disclaimer.
+   
+   2. Redistributions in binary form must reproduce the above copyright notice,
+   this list of conditions and the following disclaimer in the documentation
+   and/or other materials provided with the distribution.
+   
+   3. Neither the name of the copyright holder nor the names of its
+   contributors may be used to endorse or promote products derived from
+   this software without specific prior written permission.
+   
+   THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
+   AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
+   IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
+   DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
+   FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
+   DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+   SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+   CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
+   OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+   OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+   
+   Certain files within this repository are subject to separate licensing terms:
+   
+   - The files located in the `python/CuTeDSL` directory are licensed under the
+     NVIDIA End User License Agreement (EULA). Please refer to
+     https://docs.nvidia.com/cutlass/latest/media/docs/pythonDSL/license.html
+     for the full terms.
+
+4. Techniques and texts credited where they are used (no code copied):
+   - the int4-to-fp16 dequantization by magic numbers and LOP3 (kernels/formats.cuh,
+     cuda/int4_gemm.cu) follows Marlin (https://github.com/IST-DASLab/marlin, Apache-2.0) and
+     FasterTransformer (https://github.com/NVIDIA/FasterTransformer, Apache-2.0);
+   - the Kimi Delta Attention step order and its chunked form (crates/fullm/src/ops.rs,
+     kernels/kda_chunk.cuh) follow flash-linear-attention
+     (https://github.com/fla-org/flash-linear-attention, MIT) and the gated delta rule
+     (Yang, Kautz and Hatamizadeh, "Gated Delta Networks", 2024);
+   - the Kimi tokenizer's split pattern (KIMI_PATTERN in crates/fullm/src/tokenizer.rs) is
+     Moonshot AI's, from tokenization_kimi.py of the Kimi models;
+   - the tool-calling preamble of Qwen3's chat template (crates/fullm/src/tokenizer.rs) is
+     Qwen's text (https://huggingface.co/Qwen, Apache-2.0);
+   - the tiny Kimi K3 test checkpoint (tests/fixtures/tiny_k3) was generated with
+     make_tiny_checkpoint.py of https://github.com/FareedKhan-dev/kimi-k3-in-c (Apache-2.0).
