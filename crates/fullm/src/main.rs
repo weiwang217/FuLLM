@@ -128,6 +128,19 @@ struct ModelArgs {
     /// quarter of every step) or arrival (admission order, as vLLM and SGLang).
     #[arg(long, value_enum, default_value = "short-first")]
     prefill_order: fullm::runtime::PrefillOrder,
+    /// While requests decode, the share of the time (0 to 0.95) kept for steps without prompt
+    /// chunks: after a step that carried another request's prompt, the decodes step alone for
+    /// share / (1 - share) times as long. 0 (the default): a prompt chunk in every step, right
+    /// where a step's time barely grows with its tokens (an H100). Where it grows with them
+    /// (Inkling 2 on a Mac: 66 ms for a token alone, 4.3 s beside a 1024-token chunk) a stream
+    /// otherwise gets one token per chunk; 0.5 with --mixed-step-tokens 256 keeps it at half
+    /// speed with pauses of ~1.5 s, and the prompt takes twice as long.
+    #[arg(long, default_value_t = 0.0)]
+    decode_share: f32,
+    /// While requests decode, the most prompt tokens a step takes (0: the step's whole budget).
+    /// Smaller chunks pause the streams for less and prefill less efficiently.
+    #[arg(long, default_value_t = 0)]
+    mixed_step_tokens: usize,
     /// Speculative decoding: the most draft tokens a decoding request verifies per step (0:
     /// off). Drafts are the tokens that followed an earlier occurrence of the context's last
     /// n tokens (n-gram lookup, no draft model); a step keeps those the model agrees with. On an
@@ -470,6 +483,8 @@ fn start(a: &ModelArgs) -> Result<(fullm::runtime::EngineHandle, Arc<dyn Tokeniz
             eagle_tokens: a.spec_eagle_tokens,
             spec_own: !a.no_spec_ngram,
             spec_choice: a.spec_choice,
+            decode_share: a.decode_share,
+            mixed_step_tokens: a.mixed_step_tokens,
         },
     )
     .spawn()?;

@@ -127,6 +127,7 @@ Useful flags:
 | `--kv-dtype bf16\|fp8\|fp8-token\|int4` | the KV cache's format; `int4` is for servers limited by cache size (more users or longer contexts than `fp8` can hold): it holds 1.5x `fp8`'s positions and is slower than `fp8` when `fp8` already fits |
 | `--trunk bf16\|fp8\|int8` | the dense matrices' format |
 | `--step-tokens` | the token budget of a step |
+| `--decode-share S` `--mixed-step-tokens N` | while a request is writing, another request's prompt is read N tokens at a time and the writers get the share S of the time (off by default: prompts are read at the full step budget) |
 | `--spec-model DIR` | an EAGLE-3 head (n-gram drafts are on by default on GPUs) |
 | `--lora-merge DIR` | a LoRA adapter merged into the weights at load |
 | `--int4-checkpoint DIR` | GPTQ int4 experts |
@@ -309,6 +310,14 @@ them one at a time, FuLLM with `--max-seqs 8`):
 
 With a 1000-word context before each prompt, at c = 2 / 4: 8.9 / 11.0 tok/s aggregate (Ollama 8.6 /
 7.9) and a median first token after 17.3 / 27.6 s (22.9 / 51.1 s).
+
+By default a prompt that arrives is read at the full step budget, and a request that is writing
+waits for each of those steps. `--decode-share 0.9 --mixed-step-tokens 256` reads it in 256-token
+steps and gives the writers 90% of the time between them. With those flags, a request with a
+2000-token context that arrives while another one is writing 300 tokens gets its first token after
+25.9 s (Ollama 28.0 to 29.3 s) and both are done after 33.2 s (35.2 to 35.6 s); two requests with a
+1000-word context that arrive together get their first tokens after 9.4 and 28.8 s (11.7 and
+34.0 s), at 9.0 tok/s aggregate (8.6).
 
 ### vs vLLM on a CPU
 

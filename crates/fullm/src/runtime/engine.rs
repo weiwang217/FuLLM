@@ -25,6 +25,15 @@
 //! stop at three quarters of the budget, so the oldest of the long ones still gets a quarter of
 //! every step however many short ones arrive.
 //!
+//! DECODE SHARE (`EngineConfig::decode_share`, `mixed_step_tokens`; off by default). A prompt
+//! chunk rides in the step of the running decodes, which is free where a step's time barely grows
+//! with its tokens (an H100: ~100 ms for 2048) and not where it grows with them (Inkling 2 on an
+//! Apple GPU: 66 ms for one row, 4.3 s for 1024, so a request that was streaming gets one token
+//! per chunk of another's prompt). With a share s, after a step that carried prompt tokens beside
+//! decodes, the decodes get steps of their own for s / (1 - s) times as long as that step took,
+//! and such a step takes at most `mixed_step_tokens` prompt tokens: the streams keep about s of
+//! their speed, in pauses no longer than one such step, and the prompts take 1 / (1 - s) as long.
+//!
 //! SPECULATION (`EngineConfig::spec_tokens`). A decoding sequence whose context repeats its last
 //! few tokens (`spec::Ngram`) feeds its next token plus up to `spec_tokens` drafts: the tokens
 //! that followed the earlier occurrence. The step returns the model's output after each of them,
@@ -198,6 +207,11 @@ pub struct EngineConfig {
     pub spec_own: bool,
     /// With a draft head: how a request with an n-gram match picks its drafts' source.
     pub spec_choice: SpecChoice,
+    /// While requests decode: the share of the time kept for steps without prompt chunks (0: none;
+    /// see the module comment, DECODE SHARE).
+    pub decode_share: f32,
+    /// While requests decode: the most prompt tokens a step takes (0: the step's budget).
+    pub mixed_step_tokens: usize,
 }
 
 /// How a decoding request whose own context has an n-gram match picks between that match and the
@@ -227,6 +241,8 @@ impl Default for EngineConfig {
             eagle_tokens: 4,
             spec_own: true,
             spec_choice: SpecChoice::Adaptive,
+            decode_share: 0.0,
+            mixed_step_tokens: 0,
         }
     }
 }
@@ -596,6 +612,8 @@ pub struct Engine {
     /// the model call and the executor's own upload/download within it, post-processing).
     trace: bool,
     last_end: Option<Instant>,
+    /// With a decode share: until when the running decodes step without prompt chunks.
+    decode_until: Option<Instant>,
     /// For the trace: requests the last plan skipped while they load from the host tier, and the
     /// time it spent waiting for copies.
     loading: usize,
@@ -651,6 +669,7 @@ impl Engine {
             stats: Arc::new(Mutex::new(Stats { capacity: cap, output_ratio: 1.0, ..Default::default() })),
             trace: std::env::var_os("FULLM_STEP_TRACE").is_some(),
             last_end: None,
+            decode_until: None,
             loading: 0,
             copy_wait_ms: 0.0,
             head_need: 0,
@@ -928,6 +947,10 @@ impl Engine {
                 let mut budget = self.cfg.step_tokens.saturating_sub(decodes);
                 if decodes == 0 {
                     budget = budget.max(1);
+                } else if self.cfg.decode_share > 0.0 && self.decode_until.is_some_and(|t| Instant::now() < t) {
+                    budget = 0; // the decodes' own steps after a prompt chunk
+                } else if self.cfg.mixed_step_tokens > 0 {
+                    budget = budget.min(self.cfg.mixed_step_tokens);
                 }
                 // each prompt's tokens still to feed (0 for decodes and loads), and its chunk
                 let rest: Vec<usize> = (self.running.iter().zip(&ready))
@@ -1413,6 +1436,12 @@ impl Engine {
             s.spec_chunks += spec_chunks;
             s.spec_chunks_eagle += spec_chunks_eagle;
             s.step_ms_ema = if s.steps == 1 { ms } else { 0.9 * s.step_ms_ema + 0.1 * ms };
+        }
+        if self.cfg.decode_share > 0.0 && n_prefill > 0 && n_decode > 0 {
+            let s = self.cfg.decode_share.min(0.95) as f64;
+            self.decode_until = Some(Instant::now() + std::time::Duration::from_secs_f64(ms * 1e-3 * s / (1.0 - s)));
+        }
+        if let Ok(mut s) = self.stats.lock() {
             s.finished += finished - failed.min(finished);
             s.failed += failed;
         }
