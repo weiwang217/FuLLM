@@ -8,6 +8,7 @@
 
 pub mod dense;
 pub mod eagle;
+pub mod inkling2;
 pub mod kimi_k3;
 pub mod lora;
 pub mod paged;
@@ -480,7 +481,12 @@ pub fn detect_arch(config: &serde_json::Value) -> Result<&'static str> {
     if mt == "qwen3" || mt == "qwen3_moe" || mt == "llama" {
         return Ok("dense");
     }
-    bail!("unsupported architecture (model_type {mt:?}); this build serves: kimi_k3, kimi_linear, qwen3, qwen3_moe, llama")
+    if mt == "inkling2_loop" || mt == "inkling2_loop_text" {
+        return Ok("inkling2_loop");
+    }
+    bail!(
+        "unsupported architecture (model_type {mt:?}); this build serves: kimi_k3, kimi_linear, qwen3, qwen3_moe, llama, inkling2_loop"
+    )
 }
 
 pub fn load(dir: &Path, opts: &LoadOptions) -> Result<Box<dyn Model>> {
@@ -499,6 +505,10 @@ pub fn load(dir: &Path, opts: &LoadOptions) -> Result<Box<dyn Model>> {
             BackendKind::Executor(_) => Ok(Box::new(kimi_k3::exec::K3Exec::load(dir, &v, opts)?)),
         },
         "dense" => Ok(Box::new(dense::DenseModel::load(dir, &v, opts)?)),
+        "inkling2_loop" => match opts.backend {
+            BackendKind::Reference => Ok(Box::new(inkling2::cpu::Ink2Cpu::load(dir, &v, opts)?)),
+            BackendKind::Executor(_) => Ok(Box::new(inkling2::exec::Ink2Exec::load(dir, &v, opts)?)),
+        },
         other => bail!("no backend for {other}"),
     }
 }

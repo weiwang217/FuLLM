@@ -33,6 +33,8 @@ struct SeqState {
     /// The drafts of its last step, until `accept` (with the prefix cache: their tokens).
     draft: usize,
     draft_tokens: Vec<u32>,
+    /// Its last chunk's drafts, and how many of them `accept` kept.
+    last_draft: (usize, usize),
     /// Tests: `seq_ready` answers no this many more times after a load.
     lag: usize,
     /// Its adapter slot (`Model::set_seq_lora`): what `tokens` keys the prefix cache with.
@@ -176,6 +178,9 @@ pub struct Paged {
     entering: Vec<SeqId>,
     /// LoRA adapter slots on the executor (0: none).
     lora_slots: usize,
+    /// The executor keeps per-sequence state besides the cache by page (`page_state_enable`): a
+    /// sequence starting from cached pages takes the last one's.
+    page_state: bool,
 }
 
 impl Paged {
@@ -228,7 +233,14 @@ impl Paged {
             last_plan: PlanBufs::default(),
             entering: Vec::new(),
             lora_slots: 0,
+            page_state: false,
         })
+    }
+
+    /// The executor was told to keep its per-sequence state by page (`Executor::page_state_enable`
+    /// before `finalize`): sequences the prefix cache starts load it.
+    pub fn set_page_state(&mut self, on: bool) {
+        self.page_state = on;
     }
 
     /// The executor carries an EAGLE-3 head: `draft` runs, and the prefix cache keys each page
@@ -429,6 +441,21 @@ impl Paged {
 
     pub fn page_tokens(&self) -> usize {
         self.page
+    }
+
+    /// Positions sequence `seq` holds (drafts not yet accepted do not count).
+    pub fn seq_len(&self, seq: SeqId) -> usize {
+        self.seqs[seq].len
+    }
+
+    /// The drafts of `seq`'s last chunk and how many were kept (a draft source's record).
+    pub fn last_draft(&self, seq: SeqId) -> (usize, usize) {
+        self.seqs[seq].last_draft
+    }
+
+    /// `[slot][max_pages]`, as the steps see it.
+    pub fn page_table(&self) -> &[i32] {
+        &self.page_table
     }
 
     pub fn last_step(&self) -> Option<StepStats> {
@@ -665,7 +692,13 @@ impl Paged {
             } else {
                 rows.push((off + ch.tokens.len() - 1) as i32);
             }
-            if self.seqs[ch.seq].fresh {
+            let s = &self.seqs[ch.seq];
+            if s.fresh && self.page_state && s.len > 0 {
+                // it starts after cached pages: the state as it was when the last one was filled
+                self.ex
+                    .page_state_load(ch.seq, s.pages[s.len / self.page - 1])
+                    .map_err(|e| anyhow!("starting sequence {} from the prefix cache: {e}", ch.seq))?;
+            } else if s.fresh {
                 reset.push(ch.seq as i32);
             }
         }
@@ -684,6 +717,7 @@ impl Paged {
             s.len += keep;
             s.fresh = false;
             s.draft = ch.draft;
+            s.last_draft = (ch.draft, 0);
             if enabled {
                 let lora = s.lora;
                 s.tokens.extend(ch.tokens[..keep].iter().map(|&t| crate::models::lora_key(t, lora)));
@@ -735,8 +769,13 @@ impl Paged {
         ensure!(seq < self.seqs.len() && self.seqs[seq].used, "sequence {seq} is not allocated");
         let s = &mut self.seqs[seq];
         ensure!(n <= s.draft, "sequence {seq}: accepting {n} of {} drafts", s.draft);
+        if n < s.draft {
+            // state besides the cache (Inkling 2's convolution histories) goes back past the rejected rows
+            self.ex.drop_tail(seq, s.draft - n).map_err(|e| anyhow!("dropping rejected drafts: {e}"))?;
+        }
         s.len += n;
         s.draft = 0;
+        s.last_draft.1 = n;
         if self.pool.enabled() {
             let d = std::mem::take(&mut s.draft_tokens);
             s.tokens.extend_from_slice(&d[..n]);
@@ -820,6 +859,16 @@ impl PlanBufs {
 #[macro_export]
 macro_rules! delegate_paged {
     ($field:ident) => {
+        $crate::delegate_paged!($field, own_draft);
+        fn draft_head(&self) -> bool {
+            self.$field.draft_head()
+        }
+        fn draft(&mut self, reqs: &[$crate::models::DraftReq]) -> anyhow::Result<Vec<Vec<u32>>> {
+            self.$field.draft(reqs)
+        }
+    };
+    // (the implementing type has a draft head of its own: it writes `draft_head` and `draft`)
+    ($field:ident, own_draft) => {
         fn max_context(&self) -> usize {
             self.$field.max_context()
         }
@@ -887,12 +936,6 @@ macro_rules! delegate_paged {
         }
         fn accept(&mut self, seq: $crate::models::SeqId, n: usize) -> anyhow::Result<()> {
             self.$field.accept(seq, n)
-        }
-        fn draft_head(&self) -> bool {
-            self.$field.draft_head()
-        }
-        fn draft(&mut self, reqs: &[$crate::models::DraftReq]) -> anyhow::Result<Vec<Vec<u32>>> {
-            self.$field.draft(reqs)
         }
         fn last_step(&self) -> Option<fullm_kernels::exec::StepStats> {
             self.$field.last_step()

@@ -73,7 +73,8 @@ def one(url, model, prompt, tokens, out):
                 n = chunk["usage"].get("completion_tokens", n)
             ch = chunk.get("choices") or [{}]
             delta = ch[0].get("delta", {})
-            text = (delta.get("reasoning_content") or "") + (delta.get("content") or "")
+            # (reasoning comes as reasoning_content from vLLM, SGLang and FuLLM, as reasoning from Ollama)
+            text = (delta.get("reasoning_content") or "") + (delta.get("reasoning") or "") + (delta.get("content") or "")
             if text.replace("<think>", "").replace("</think>", "").strip():
                 chunks += 1
                 if first is None:

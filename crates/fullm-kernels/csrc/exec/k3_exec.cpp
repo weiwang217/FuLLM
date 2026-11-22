@@ -1502,6 +1502,16 @@ sk_exec *sk_exec_create_dense(const sk_dense_dims *dims, const sk_exec_opts *opt
     return create([&] { return fullm::make_dense_exec(*dims, *opts); }, err, err_len);
 }
 
+sk_exec *sk_exec_create_ink2(const sk_ink2_dims *dims, const sk_exec_opts *opts, char *err, int err_len) {
+    return create([&] { return fullm::make_ink2_exec(*dims, *opts); }, err, err_len);
+}
+
+int sk_exec_set_ink2_experts(sk_exec *e, int32_t layer, int32_t fmt, const uint8_t *w13, const uint8_t *w13_scale,
+                             const float *w13_factor, const uint8_t *w2, const uint8_t *w2_scale,
+                             const float *w2_factor, char *err, int err_len) {
+    SK_TRY(e->ex->set_ink2_experts(layer, fmt, w13, w13_scale, w13_factor, w2, w2_scale, w2_factor))
+}
+
 void sk_exec_destroy(sk_exec *e) { delete e; }
 
 int sk_exec_add_matrix(sk_exec *e, const char *name, int32_t fmt, int64_t rows, int64_t cols, const void *data,
@@ -1583,6 +1593,18 @@ int sk_exec_save_slot(sk_exec *e, int32_t slot, void *dst, char *err, int err_le
 
 int sk_exec_load_slot(sk_exec *e, int32_t slot, const void *src, char *err, int err_len) {
     SK_TRY(e->ex->load_slot(slot, src))
+}
+
+int sk_exec_drop_tail(sk_exec *e, int32_t slot, int32_t n, char *err, int err_len) { SK_TRY(e->ex->drop_tail(slot, n)) }
+int sk_exec_set_ink2_mtp(sk_exec *e, const sk_ink2_mtp *cfg, char *err, int err_len) { SK_TRY(e->ex->set_ink2_mtp(*cfg)) }
+int sk_exec_ink2_has_draft(const sk_exec *e) { return e->ex->ink2_has_draft() ? 1 : 0; }
+int sk_exec_ink2_draft(sk_exec *e, int32_t n, const int32_t *slots, const int32_t *next, const int32_t *pos,
+                       const int32_t *page_table, int32_t k, int32_t *out, float *conf, char *err, int err_len) {
+    SK_TRY(e->ex->ink2_draft(n, slots, next, pos, page_table, k, out, conf))
+}
+int sk_exec_page_state_enable(sk_exec *e, char *err, int err_len) { SK_TRY(e->ex->page_state_enable()) }
+int sk_exec_page_state_load(sk_exec *e, int32_t slot, int32_t page, char *err, int err_len) {
+    SK_TRY(e->ex->page_state_load(slot, page))
 }
 
 size_t sk_exec_page_bytes(const sk_exec *e) { return e->ex->page_bytes(); }

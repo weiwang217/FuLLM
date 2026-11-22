@@ -77,7 +77,10 @@ inline float reduce16(const float a[16]) {
 // ------------------------------------------------------------------ dots
 // dot(x, w, K) and dot4 (four x rows, one w) with identical per-row arithmetic.
 
-float dot_portable(const float *x, const float *w, int64_t K) {
+// Never inlined: dot4 and every other caller then run this one compiled body. Inlined copies let
+// the compiler contract the tail's `s += x * w` to an fma in one caller and not in another, and a
+// row's last bits then depended on whether it went through dot or dot4 (widths off the 16 step).
+__attribute__((noinline)) float dot_portable(const float *x, const float *w, int64_t K) {
     float acc[16] = {0};
     int64_t k = 0;
     for (; k + 16 <= K; k += 16)

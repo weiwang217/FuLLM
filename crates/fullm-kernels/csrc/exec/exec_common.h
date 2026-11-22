@@ -363,6 +363,14 @@ public:
     virtual size_t slot_bytes() const = 0;
     virtual void save_slot(int32_t slot, void *dst) = 0;
     virtual void load_slot(int32_t slot, const void *src) = 0;
+    virtual void drop_tail(int32_t, int32_t) {}
+    virtual void set_ink2_mtp(const sk_ink2_mtp &) { throw std::runtime_error("this executor has no draft head"); }
+    virtual bool ink2_has_draft() const { return false; }
+    virtual void ink2_draft(int32_t, const int32_t *, const int32_t *, const int32_t *, const int32_t *, int32_t, int32_t *, float *) {
+        throw std::runtime_error("this executor has no draft head");
+    }
+    virtual void page_state_enable() { throw std::runtime_error("this executor keeps no per-page state"); }
+    virtual void page_state_load(int32_t, int32_t) { throw std::runtime_error("this executor keeps no per-page state"); }
     virtual const char *describe() = 0;
     // routed experts: MoE families only
     virtual void set_expert(int32_t, int32_t, const ExpertPtrs &) { no_experts(); }
@@ -372,6 +380,11 @@ public:
         no_experts();
     }
     virtual size_t pool_bytes() const { return 0; }
+    // Inkling 2's experts, read in place (sk_exec_set_ink2_experts)
+    virtual void set_ink2_experts(int32_t, int32_t, const uint8_t *, const uint8_t *, const float *, const uint8_t *,
+                                  const uint8_t *, const float *) {
+        no_experts();
+    }
     // LoRA adapters, unmerged (sk_exec_reserve_lora ...): dense executors only
     virtual void reserve_lora(int32_t, int32_t, uint32_t) { throw std::runtime_error("this executor has no LoRA adapters"); }
     virtual void set_lora(int32_t, int32_t, int32_t, const uint16_t *, size_t, const uint16_t *, size_t, int32_t, float) {
@@ -403,5 +416,6 @@ private:
 
 std::unique_ptr<ExecIface> make_k3_exec(const sk_k3_dims &d, const sk_exec_opts &o);
 std::unique_ptr<ExecIface> make_dense_exec(const sk_dense_dims &d, const sk_exec_opts &o);
+std::unique_ptr<ExecIface> make_ink2_exec(const sk_ink2_dims &d, const sk_exec_opts &o);
 
 }  // namespace fullm

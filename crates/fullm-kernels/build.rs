@@ -36,6 +36,7 @@ fn main() {
         .file(csrc.join("exec/expert_pool.cpp"))
         .file(csrc.join("exec/k3_exec.cpp"))
         .file(csrc.join("exec/dense_exec.cpp"))
+        .file(csrc.join("exec/ink2_exec.cpp"))
         .flag_if_supported("-fno-math-errno")
         .flag_if_supported("-pthread")
         .warnings(true);
@@ -46,6 +47,26 @@ fn main() {
         cpp.define("FULLM_TORCH", None);
     }
     cpp.compile("fullm_cpu");
+
+    // Apple GPUs: Inkling 2's experts on Metal (csrc/exec/metal), Objective-C++
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("macos") {
+        let mut mm = cc::Build::new();
+        mm.cpp(true)
+            .std("c++17")
+            .opt_level(3)
+            .include(csrc.join("include"))
+            .include(csrc.join("exec"))
+            .include(csrc.join("exec/metal"))
+            .file(csrc.join("exec/metal/ink2_metal.mm"))
+            .flag("-fobjc-arc")
+            .warnings(true);
+        mm.compile("fullm_metal");
+        println!("cargo:rustc-link-lib=framework=Metal");
+        println!("cargo:rustc-link-lib=framework=MetalPerformanceShaders");
+        println!("cargo:rustc-link-lib=framework=Foundation");
+        println!("cargo:rustc-link-lib=framework=QuartzCore");
+        println!("cargo:rustc-link-lib=framework=CoreGraphics");
+    }
 
     if torch {
         build_torch(&csrc);

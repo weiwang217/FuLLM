@@ -11,14 +11,14 @@ FuLLM is a single-GPU LLM inference engine written in Rust and C++/CUDA. It aims
 
 The engine does inference only: you bring a trained or fine-tuned checkpoint. It targets NVIDIA H100
 (sm90), with RTX 50 laptops (sm120) and CPUs (x86 AVX-512 / AVX2, Apple silicon) as the other
-backends.
+backends. On a Mac, Inkling 2 runs its steps on the Apple GPU (Metal).
 
 It serves an OpenAI-compatible API with these features:
 
 - chat and completions, streamed;
-- tool calls (Qwen3);
+- tool calls (Qwen3, Inkling 2);
 - `response_format` json_schema, enforced on the device;
-- n-gram and EAGLE-3 speculative decoding;
+- n-gram and EAGLE-3 speculative decoding, and Inkling 2's own draft head (MTP / DSpark);
 - a radix prefix cache with a host-memory tier;
 - multi-LoRA;
 - sampling parameters, log-probabilities and stop strings.
@@ -31,6 +31,7 @@ It serves an OpenAI-compatible API with these features:
 | Qwen3-30B-A3B (MoE) | experts bf16 / fp8b / int8 / int4, GPTQ int4 checkpoints; KV bf16 / fp8 / int4 | for agents: fp8b experts + bf16 KV |
 | Kimi Linear 48B-A3B (KDA + MLA hybrid) | experts bf16 / fp8b / int8 / int4 | in HBM at 8 bits or below; HBM / CPU split at bf16 |
 | Kimi K3 | MXFP4 experts in DRAM | the first layers verified against a reference; full model needs a large host |
+| Inkling 2 Mini (looped MoE) | experts as released (NVFP4 / MXFP8), read in place; KV half / f32 | Apple GPU (Metal) and CPU; its draft head, prefix cache, tool calls |
 
 ## Architecture
 
@@ -111,6 +112,10 @@ fullm serve --model /data/qwen3-8b --backend cuda --lora sql=/data/lora-sql --lo
 
 # CPU backend (e.g. on a Mac)
 fullm serve --model /data/qwen3-0.6b --backend cpu --max-seqs 8 --served-name qwen3 --port 8000
+
+# Inkling 2 Mini on a Mac: the steps run on the Apple GPU; drafts from the model's own head
+fullm serve --model ~/models/inkling2-mini --backend cpu --step-tokens 1024 --page 16 --cache-tokens 8192 \
+  --spec-tokens 7 --spec-eagle-tokens 7 --port 8000
 ```
 
 Useful flags:
@@ -269,6 +274,41 @@ FlashAttention-3, with long contexts in chunks of keys. With fp8b experts in HBM
 prefills at 33269 tok/s and an 8192-token prompt at 41448 tok/s. A server request with a 3000-word
 context gets its first token in 116 ms. With the default settings a 1M-token window works: prompts of
 251K / 505K / 1.0M tokens get their first token in 13.8 / 43.4 / 148 s.
+
+### vs Ollama: Inkling 2 Mini on a Mac
+
+Inkling 2 Mini (26B, 128 routed experts, 20 GB as released) on an M3 Pro with 36 GB, both engines on
+the Apple GPU. Ollama 0.40.17 runs the model on MLX and drafts with the model's own head, as FuLLM
+does here. One request at a time, streamed, temperature 0, the same chat prompts with the same
+token counts on both sides (2026-11-22).
+
+Sixteen prompts, 250 tokens each: eight with a context of 700 to 2700 tokens (summaries,
+extraction, translation, code review) and eight short ones (questions, a story, code, Chinese):
+
+| measurement | FuLLM | Ollama | FuLLM vs Ollama |
+|---|---|---|---|
+| time to first token, prompts with a context (median ratio) | 3.1 to 11.9 s | 4.0 to 16.4 s | 1.27x sooner |
+| time to first token, short prompts (median ratio) | 0.44 to 0.70 s | 0.71 to 1.14 s | 1.46x sooner |
+| decode, all 4000 tokens | 18.0 tok/s | 17.4 tok/s | +3% |
+| all sixteen requests, end to end | 291 s | 323 s | 10% less |
+
+The first token came sooner on all sixteen. Decoding was faster on eleven and slower on five: both
+engines verify drafts, and the rate follows how many of them the text being written lets them
+keep (translation 29 tok/s, free writing 14 to 15).
+
+A 2938-token prompt gets its first token in 12.6 s (Ollama 16.3 s) and the whole request with 200
+generated tokens takes 24.0 s (27.4 s).
+
+Several requests at once (`tools/bench_openai.py`, 200 tokens each; Ollama as installed, which takes
+them one at a time, FuLLM with `--max-seqs 8`):
+
+| short prompts, c = 1 / 2 / 4 / 8 | FuLLM | Ollama | FuLLM / Ollama |
+|---|---|---|---|
+| aggregate tok/s | 14.8 / 18.8 / 24.1 / 32.7 | 13.5 / 13.8 / 13.9 / 13.4 | 1.1 / 1.4 / 1.7 / 2.4x |
+| time to first token, median | 0.7 / 0.9 / 1.1 / 1.8 s | 1.1 / 8.4 / 21.6 / 51.2 s | 1.5 / 9.6 / 19 / 28x sooner |
+
+With a 1000-word context before each prompt, at c = 2 / 4: 8.9 / 11.0 tok/s aggregate (Ollama 8.6 /
+7.9) and a median first token after 17.3 / 27.6 s (22.9 / 51.1 s).
 
 ### vs vLLM on a CPU
 

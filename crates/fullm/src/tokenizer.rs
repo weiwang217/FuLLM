@@ -120,6 +120,21 @@ pub struct ChatMarkers {
     /// A whole reply drops the newlines around each channel (Qwen3: `<think>\n...\n</think>\n\n` answer).
     /// ChatStream passes them on, so a stream and the stop strings see the text as generated.
     pub trim_newlines: bool,
+    /// A reply made of messages, each opened by a control token that names its channel (Inkling 2:
+    /// `<|message_model|><|content_thinking|>` ... `<|end_message|><|message_model|><|content_text|>`
+    /// ... `<|end_message|>`): the markers above are then unused.
+    pub channels: Option<ChannelIds>,
+    /// With `channels`: the prompt already opened the answer's message (thinking off).
+    pub starts_in_answer: bool,
+}
+
+/// The control tokens of a reply in messages: what opens a reasoning message's text and an
+/// answer's, and what ends a message. Anything between messages (a header, a call's name) is not text.
+#[derive(Clone, Copy, Debug)]
+pub struct ChannelIds {
+    pub thinking: u32,
+    pub text: u32,
+    pub end: u32,
 }
 
 pub trait Tokenizer: Send + Sync {
@@ -255,6 +270,11 @@ pub struct ChatStream {
 impl ChatStream {
     pub fn new(markers: ChatMarkers) -> Self {
         let phase = Some(if markers.starts_in_reasoning { Channel::Reasoning } else { Channel::Content });
+        let phase = match markers.channels {
+            Some(_) if markers.starts_in_answer => Some(Channel::Content),
+            Some(_) => None,
+            None => phase,
+        };
         ChatStream {
             markers,
             phase,
@@ -270,8 +290,30 @@ impl ChatStream {
         self.phase == Some(Channel::Content) && self.held.is_empty()
     }
 
+    /// Whether a tool call's block may open here: in the answer channel, or between messages
+    /// when the reply is made of them.
+    pub fn tool_ok(&self) -> bool {
+        match self.markers.channels {
+            Some(_) => self.phase.is_none(),
+            None => self.in_content(),
+        }
+    }
+
     pub fn push(&mut self, tok: &dyn Tokenizer, id: u32) -> Vec<(Channel, String)> {
         let mut out = Vec::new();
+        if let Some(c) = self.markers.channels {
+            // a reply in messages: the channel's token opens its text, the end token closes it
+            if id == c.thinking {
+                self.phase = Some(Channel::Reasoning);
+            } else if id == c.text {
+                self.phase = Some(Channel::Content);
+            } else if id == c.end {
+                self.phase = None;
+            } else if let Some(phase) = self.phase {
+                self.emit(tok, phase, id, &mut out);
+            }
+            return out;
+        }
         if self.phase.is_none() {
             return out;
         }
@@ -676,8 +718,21 @@ impl KimiTokenizer {
         let tools = (!opts.tools.is_empty()).then(|| serde_json::Value::Array(opts.tools.clone()));
         let mut kwargs = opts.kwargs.clone();
         kwargs.insert("enable_thinking".into(), serde_json::Value::Bool(opts.thinking));
+        if self.channel_ids().is_some() && !kwargs.contains_key("reasoning_effort") {
+            // Inkling 2 takes an effort (none .. max, or 0 .. 0.99; the template's default is high):
+            // thinking off is none; a request's effort as given ("max" is also this server's
+            // default when a request names none, so it is left to the template)
+            if !opts.thinking {
+                kwargs.insert("reasoning_effort".into(), "none".into());
+            } else if opts.thinking_effort != "max" {
+                kwargs.insert("reasoning_effort".into(), opts.thinking_effort.clone().into());
+            }
+        }
         let text = tpl.render(&serde_json::Value::Array(messages), tools.as_ref(), true, &kwargs)?;
         let mut ids = self.encode_with_special(&text);
+        if let (Some((c, _)), true) = (self.channel_ids(), self.answer_opened(opts)) {
+            ids.extend([self.special_id("<|message_model|>")?, c.text]);
+        }
         if opts.thinking && self.think_prompt && !text.ends_with("<think>\n") {
             if let Ok(ts) = self.special_id("<think>") {
                 ids.push(ts);
@@ -689,6 +744,30 @@ impl KimiTokenizer {
 
     pub fn format(&self) -> ChatFormat {
         self.format
+    }
+
+    /// Inkling 2 with thinking off and no tools: the prompt opens the answer's message itself. The
+    /// model reasons at any effort, "none" too, when left to open its own; with tools it is left
+    /// to, since a call is a message of its own.
+    fn answer_opened(&self, opts: &ChatOptions) -> bool {
+        !opts.thinking && opts.tools.is_empty() && self.special_id("<|message_model|>").is_ok()
+    }
+
+    /// Inkling 2's reply format (a template's vocabulary with its message and channel tokens):
+    /// the channel tokens, and the one that opens a tool call's JSON.
+    fn channel_ids(&self) -> Option<(ChannelIds, u32)> {
+        if self.format != ChatFormat::Template {
+            return None;
+        }
+        let id = |s: &str| self.special_id(s).ok();
+        Some((
+            ChannelIds {
+                thinking: id("<|content_thinking|>")?,
+                text: id("<|content_text|>")?,
+                end: id("<|end_message|>")?,
+            },
+            id("<|content_invoke_tool_json|>")?,
+        ))
     }
 
     /// ChatML as Qwen3's chat template renders it: per message `<|im_start|>` + role + `\n` +
@@ -1218,6 +1297,13 @@ impl Tokenizer for KimiTokenizer {
     }
 
     fn chat_markers(&self, opts: &ChatOptions) -> ChatMarkers {
+        if let Some((channels, _)) = self.channel_ids() {
+            return ChatMarkers {
+                channels: Some(channels),
+                starts_in_answer: self.answer_opened(opts),
+                ..Default::default()
+            };
+        }
         if matches!(self.format, ChatFormat::ChatMl | ChatFormat::Template) {
             // Qwen3: the turn opens with <think> unless thinking is off (the prompt then closed an
             // empty one) or the prompt opened it (think_prompt); the answer follows </think>; the
@@ -1257,6 +1343,10 @@ impl Tokenizer for KimiTokenizer {
         // Qwen's (hermes) <tool_call> blocks, in ChatML or another template that has the tokens
         match self.format {
             ChatFormat::ChatMl | ChatFormat::Template => {
+                // (Inkling 2: a message `<|message_model|>name<|content_invoke_tool_json|>` JSON `<|end_message|>`)
+                if let Some((c, invoke)) = self.channel_ids() {
+                    return Some((invoke, c.end));
+                }
                 Some((self.special_id("<tool_call>").ok()?, self.special_id("</tool_call>").ok()?))
             }
             _ => None,

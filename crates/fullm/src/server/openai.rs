@@ -571,7 +571,14 @@ pub(super) async fn chat_completions(State(st): State<Arc<AppState>>, body: Byte
             "at most one of a forced tool_choice, response_format and the guided fields",
         );
     }
-    let after = (markers.starts_in_reasoning && markers.think_end.len() == 1).then(|| markers.think_end[0]);
+    if markers.channels.is_some() && matches!(choice, ToolChoice::Required | ToolChoice::Named(_)) {
+        return error(StatusCode::BAD_REQUEST, "a forced tool_choice is not implemented for this model's chat format");
+    }
+    // (a reply in messages: from the token that opens the answer's text)
+    let after = match markers.channels {
+        Some(c) => Some(c.text),
+        None => (markers.starts_in_reasoning && markers.think_end.len() == 1).then(|| markers.think_end[0]),
+    };
     let guide = match grammars.pop().map(|g| constraint(&st, g, after)).transpose() {
         Ok(c) => c,
         Err(e) => return error(StatusCode::BAD_REQUEST, e),
@@ -581,7 +588,10 @@ pub(super) async fn chat_completions(State(st): State<Arc<AppState>>, body: Byte
         Err(e) => return error(StatusCode::BAD_REQUEST, format!("{e:#}")),
     };
     let (id, created, model) = (new_id("chatcmpl"), now(), st.model_name.clone());
-    let (reasons, trim) = (opts.thinking && !markers.think_end.is_empty(), markers.trim_newlines);
+    // (a reply in messages reports the reasoning it has, thinking asked for or not)
+    let by_message = markers.channels.is_some();
+    let reasons = (opts.thinking && !markers.think_end.is_empty()) || by_message;
+    let trim = markers.trim_newlines;
     let mut out = Output::new(tok, Some(ChatStream::new(markers)), stops, cancel);
     out.tools = tool_ids.map(|(open, close)| ToolCalls { open, close, ..Default::default() });
 
@@ -606,7 +616,7 @@ pub(super) async fn chat_completions(State(st): State<Arc<AppState>>, body: Byte
         // the whitespace around calls (the template's, or a forced call's leading run) is no reply
         let content = if content.trim().is_empty() && !calls.is_empty() { Value::Null } else { json!(content) };
         let mut message = json!({"role": "assistant", "content": content});
-        if reasons {
+        if reasons && !(by_message && reasoning.is_empty()) {
             message["reasoning_content"] = json!(reasoning);
         }
         if !calls.is_empty() {
@@ -841,7 +851,8 @@ fn tool_call(text: &str) -> Option<Value> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let v: Value = serde_json::from_str(text.trim()).ok()?;
     let name = v.get("name")?.as_str()?.to_string();
-    let args = match v.get("arguments") {
+    // (Inkling 2 writes `args`)
+    let args = match v.get("arguments").or_else(|| v.get("args")) {
         Some(Value::String(s)) => s.clone(),
         Some(a) => py_json(a),
         None => "{}".to_string(),
@@ -985,7 +996,7 @@ impl Output {
                 None => vec![(Channel::Content, format!("<tool_call>{text}</tool_call>"))],
             });
         }
-        if t == tc.open && self.chat.as_ref().is_some_and(|c| c.in_content()) {
+        if t == tc.open && self.chat.as_ref().is_some_and(|c| c.tool_ok()) {
             tc.inside = Some(Vec::new());
             return Some(Vec::new());
         }

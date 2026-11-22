@@ -131,6 +131,83 @@ typedef struct {
 sk_exec *sk_exec_create_dense(const sk_dense_dims *dims, const sk_exec_opts *opts, char *err,
                               int err_len);
 
+/* Inkling 2 (looped): thinkingmachines/Inkling-2-Mini's text decoder (ink2_exec.cpp; the model is
+ * stated in crates/fullm/src/models/inkling2). Layers loop_start..loop_end run `passes` times with
+ * shared weights; every layer visit has its own key / value pools and convolution histories.
+ * Tensors, by name ("L{i}." per layer; matrices bf16 or f32, [out][in]):
+ *   matrices  "embed" [vocab][hidden] (host memory, read in place), "lm_head" [out_vocab][hidden];
+ *             per layer "q" [hq*d][hidden], "k" and "v" [hk*d][hidden], "o" [hidden][hq*d], "og"
+ *             (the output gate) [hq*d][hidden], "sink" [hq][hidden], "rel" [hq*d_rel][hidden],
+ *             "router" [n_experts][hidden]; full layers "k_wp" and "v_wp" [hk*conv_k][hidden];
+ *             loop layers "cq_" / "ck_" / "cv_" / "cm_" + "down" [gate_rank][2*hidden], "forget"
+ *             and "gain" [hidden][gate_rank] (the message gates of the query, key, value and MLP
+ *             inputs)
+ *   vectors   "embed_norm", "final_norm", "out_query" [hidden], "msg_queries" [loop layers][4]
+ *             [hidden] (query, key, value, mlp); per layer "attn_query" ([hidden], full layers
+ *             [3][hidden]; not layer 0), "mlp_query", "post_norm", "q_scale" [hq*d], "rel_scale"
+ *             [hq*d_rel], "rel_proj" [d_rel][extent], "attn_conv" and "mlp_conv" [hidden][conv_k],
+ *             "router_bias" [n_experts]; sliding layers "in_norm", "k_conv" and "v_conv" [hk*d]
+ *             [conv_k]; full layers "q_norm", "k_norm", "v_norm", "k_static" and "v_static"
+ *             [conv_k][hk*d]
+ * and each layer's experts with sk_exec_set_ink2_experts. Host backends only so far; the cache
+ * is f32, or half (kv_dtype SK_DT_BF16: 16 bits a value) where the steps run on a GPU. */
+typedef struct {
+    int32_t hidden, n_layers, vocab, out_vocab;
+    float rms_eps;
+    int32_t full_hq, full_hk, full_d; /* heads, kv heads, head width of the full layers */
+    int32_t swa_hq, swa_hk, swa_d;    /* ... of the sliding-window layers */
+    int32_t window, d_rel, rel_extent;
+    float log_n_floor, log_alpha, qk_clip, rel_clip;
+    int32_t conv_k, block;
+    int32_t n_experts, topk, moe_inter;
+    float gate_softcap, up_softcap, route_scale, logit_softcap;
+    int32_t loop_start, loop_end, passes, gate_rank;
+    const uint8_t *layer_sliding; /* [n_layers], 1 = attends to the last `window` positions */
+} sk_ink2_dims;
+sk_exec *sk_exec_create_ink2(const sk_ink2_dims *dims, const sk_exec_opts *opts, char *err, int err_len);
+/* A layer's experts, read in place (host memory that outlives the executor): w13 [n_experts]
+ * [2*moe_inter][hidden] with rows gate 0, up 0, gate 1, ..., w2 [n_experts][hidden][moe_inter].
+ * SK_XFMT_NVFP4: two E2M1 codes a byte (the even element in the low nibble), scales e4m3 one per
+ * 16 values, factor [n_experts] (amax / outer_scale_denominator). SK_XFMT_MXFP8: e4m3 values,
+ * scales one exponent byte (2^(s - 127)) per 32 values. SK_XFMT_BF16: bf16 values, no scales. */
+enum { SK_XFMT_NVFP4 = 0, SK_XFMT_MXFP8 = 1, SK_XFMT_BF16 = 2 };
+int sk_exec_set_ink2_experts(sk_exec *e, int32_t layer, int32_t fmt, const uint8_t *w13, const uint8_t *w13_scale,
+                             const float *w13_factor, const uint8_t *w2, const uint8_t *w2_scale,
+                             const float *w2_factor, char *err, int err_len);
+/* Inkling 2's draft head (the release's mtp.safetensors, a DSpark draft), before finalize: a block
+ * of `block` rows (the last sampled token, then mask rows) through n_layers layers whose attention
+ * sees, unmasked, the block and keys / values made from the target's features at every earlier
+ * position (the `window` before the block in the layers marked local), then a recurrent head of
+ * width `rank` that chains block - 1 tokens. taps: the layer visits, in running order, whose input
+ * stream is a feature; the last is the number of visits and names the final norm's output.
+ * Tensors (add_matrix, bf16): "mtp.L<i>.q" [hq*d][hidden], ".k", ".v", ".k_ctx", ".v_ctx" [hk*d]
+ * [hidden], ".o" [hidden][hq*d], ".gate", ".up" [inter][hidden], ".down" [hidden][inter];
+ * "mtp.rnn_s" [3 rank][2 rank] (rnn_proj's state and previous-token columns), "mtp.rnn_x" [3 rank]
+ * [2 hidden] (its row and feature columns), "mtp.w1" [vocab][rank], "mtp.hidden_out" [hidden]
+ * [rank]. Vectors: "mtp.L<i>.dflare", ".in_norm", ".post_norm" [hidden], ".q_norm", ".k_norm",
+ * ".k_norm_ctx" [d]; "mtp.fuse" [(n_layers + 1) * 4] (softmaxed here), "mtp.mask", "mtp.norm",
+ * "mtp.m_dflare", "mtp.hidden_out_b" [hidden], "mtp.rnn_b" [3 rank].
+ * The head runs where the steps run on a GPU (Metal); elsewhere it is not used. */
+typedef struct {
+    int32_t n_layers, hq, hk, d, inter, window, block, rank;
+    float theta;
+    int32_t taps[4];
+    uint8_t local[8];
+} sk_ink2_mtp;
+int sk_exec_set_ink2_mtp(sk_exec *e, const sk_ink2_mtp *cfg, char *err, int err_len);
+/* Whether the head drafts (after finalize). */
+int sk_exec_ink2_has_draft(const sk_exec *e);
+/* After a step (and its sk_exec_drop_tail calls): up to k (< block) drafts for each of n sequences
+ * of that step. Sequence i (slot slots[i]) holds pos[i] positions and the token sampled after its
+ * last one is next[i]; the drafts are the tokens the head expects after next[i], into out [n][k],
+ * each with its probability under the head's logits in conf [n][k] (every draft given the ones
+ * before it: the product over a prefix estimates the chance the model agrees with all of it).
+ * page_table as a step's. */
+int sk_exec_ink2_draft(sk_exec *e, int32_t n, const int32_t *slots, const int32_t *next, const int32_t *pos,
+                       const int32_t *page_table, int32_t k, int32_t *out, float *conf, char *err, int err_len);
+/* The integer-dot NVFP4 expert rows (ink2_exec.cpp) against the rows decoded to floats, on random
+ * data: the largest error over the outputs' RMS; -1 when this build has no integer path. */
+double sk_ink2_sdot_error(void);
 /* An EAGLE-3 draft head on a dense executor (before finalize). Every step keeps, for each of its
  * tokens, the residual stream entering layers taps[0], taps[1], taps[2] (layer 0: the embedding),
  * side by side; sk_exec_draft runs the head on rows of the last step. The head's layer has the
@@ -330,6 +407,18 @@ void sk_sample_rows_host(int32_t *tokens, const float *logits, int64_t rows, int
 size_t sk_exec_slot_bytes(const sk_exec *e);
 int sk_exec_save_slot(sk_exec *e, int32_t slot, void *host_dst, char *err, int err_len);
 int sk_exec_load_slot(sk_exec *e, int32_t slot, const void *host_src, char *err, int err_len);
+/* After a step: the last n rows of `slot`'s segment in it are void (rejected drafts). An executor
+ * whose per-sequence state is more than the paged cache puts it back as it was after the rows
+ * before them (Inkling 2: the convolution histories, for up to 16 rows); the others have nothing
+ * to do: the cache positions are simply written again. */
+int sk_exec_drop_tail(sk_exec *e, int32_t slot, int32_t n, char *err, int err_len);
+/* Per-sequence state besides the paged cache, kept by cache page so that a page can start another
+ * sequence (the prefix cache): after enable (before finalize), every step keeps, for each page a
+ * sequence fills to its last position, the state as it is after that position (Inkling 2: the
+ * convolution histories, slot_bytes a page, committed as pages fill); load puts page `page`'s into
+ * `slot`, whose next token is then the one after the page. Executors without such state refuse. */
+int sk_exec_page_state_enable(sk_exec *e, char *err, int err_len);
+int sk_exec_page_state_load(sk_exec *e, int32_t slot, int32_t page, char *err, int err_len);
 
 /* The prefix cache's host tier (paged-cache executors; after finalize). A host page holds one
  * cache page of every paged pool: sk_exec_page_bytes bytes, 0 when the executor has no host tier.

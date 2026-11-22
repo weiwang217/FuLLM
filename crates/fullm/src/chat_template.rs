@@ -23,8 +23,6 @@ pub struct ChatTemplate {
 impl ChatTemplate {
     /// `bos` / `eos`: the tokenizer's token strings, as the template sees them.
     pub fn new(source: &str, bos: Option<String>, eos: Option<String>) -> Result<Self> {
-        let source = source.replace("{% generation %}", "").replace("{%- generation %}", "");
-        let source = source.replace("{% endgeneration %}", "").replace("{%- endgeneration %}", "");
         let mut env = Environment::new();
         let mut syntax = SyntaxConfig::builder();
         syntax.trim_blocks(true).lstrip_blocks(true);
@@ -35,6 +33,9 @@ impl ChatTemplate {
             Err(Error::new(ErrorKind::InvalidOperation, msg))
         });
         env.add_function("strftime_now", |fmt: String| chrono::Local::now().format(&fmt).to_string());
+        // transformers' `{% generation %}` ... `{% endgeneration %}` only marks the assistant's spans
+        // for training masks; it renders its body unchanged, so the tags are dropped
+        let source = strip_generation_tags(source);
         env.add_template_owned("chat", source).context("parsing the chat template")?;
         Ok(ChatTemplate { env, bos, eos })
     }
@@ -207,4 +208,33 @@ mod tests {
         let src = "{% for m in messages %}{% generation %}{{ m.content }}{% endgeneration %}{% endfor %}";
         assert_eq!(render(src, json!([{"role": "assistant", "content": "ok"}]), json!({})), "ok");
     }
+}
+
+/// `source` without transformers' generation tags (`{%- generation -%}`, `{% endgeneration %}`,
+/// any whitespace control): each replaced by an empty statement with the same whitespace control.
+fn strip_generation_tags(source: &str) -> String {
+    let mut out = String::with_capacity(source.len());
+    let mut rest = source;
+    while let Some(i) = rest.find("{%") {
+        let Some(j) = rest[i..].find("%}") else { break };
+        let tag = &rest[i..i + j + 2];
+        let inner = tag[2..tag.len() - 2].trim_matches(|c: char| c == '-' || c == '+' || c.is_whitespace());
+        out.push_str(&rest[..i]);
+        if inner == "generation" || inner == "endgeneration" {
+            // keep the whitespace trimming the tag asked for
+            let (l, r) = (tag[2..].starts_with('-'), tag[..tag.len() - 2].ends_with('-'));
+            out.push_str(&format!(
+                "{{%{} if true {}%}}{{%{} endif {}%}}",
+                if l { "-" } else { "" },
+                "-",
+                "-",
+                if r { "-" } else { "" }
+            ));
+        } else {
+            out.push_str(tag);
+        }
+        rest = &rest[i + j + 2..];
+    }
+    out.push_str(rest);
+    out
 }

@@ -196,6 +196,108 @@ pub struct K3Dims {
     pub layer_is_mla: Vec<u8>,
 }
 
+/// Inkling 2's draft head; see `sk_ink2_mtp` in fullm_exec.h.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Ink2Mtp {
+    pub n_layers: i32,
+    pub hq: i32,
+    pub hk: i32,
+    pub d: i32,
+    pub inter: i32,
+    pub window: i32,
+    pub block: i32,
+    pub rank: i32,
+    pub theta: f32,
+    pub taps: [i32; 4],
+    pub local: [u8; 8],
+}
+
+/// Inkling 2 (looped) dimensions; see `sk_ink2_dims` in fullm_exec.h.
+#[derive(Clone, Debug, Default)]
+pub struct Ink2Dims {
+    pub hidden: i32,
+    pub n_layers: i32,
+    pub vocab: i32,
+    pub out_vocab: i32,
+    pub rms_eps: f32,
+    /// (query heads, kv heads, head width) of the full and of the sliding-window layers.
+    pub full: (i32, i32, i32),
+    pub swa: (i32, i32, i32),
+    pub window: i32,
+    pub d_rel: i32,
+    pub rel_extent: i32,
+    pub log_n_floor: f32,
+    pub log_alpha: f32,
+    pub qk_clip: f32,
+    pub rel_clip: f32,
+    pub conv_k: i32,
+    pub block: i32,
+    pub n_experts: i32,
+    pub topk: i32,
+    pub moe_inter: i32,
+    pub gate_softcap: f32,
+    pub up_softcap: f32,
+    pub route_scale: f32,
+    pub logit_softcap: f32,
+    pub loop_start: i32,
+    pub loop_end: i32,
+    pub passes: i32,
+    pub gate_rank: i32,
+    pub layer_sliding: Vec<u8>,
+}
+
+#[repr(C)]
+struct SkInk2Dims {
+    hidden: i32,
+    n_layers: i32,
+    vocab: i32,
+    out_vocab: i32,
+    rms_eps: f32,
+    full_hq: i32,
+    full_hk: i32,
+    full_d: i32,
+    swa_hq: i32,
+    swa_hk: i32,
+    swa_d: i32,
+    window: i32,
+    d_rel: i32,
+    rel_extent: i32,
+    log_n_floor: f32,
+    log_alpha: f32,
+    qk_clip: f32,
+    rel_clip: f32,
+    conv_k: i32,
+    block: i32,
+    n_experts: i32,
+    topk: i32,
+    moe_inter: i32,
+    gate_softcap: f32,
+    up_softcap: f32,
+    route_scale: f32,
+    logit_softcap: f32,
+    loop_start: i32,
+    loop_end: i32,
+    passes: i32,
+    gate_rank: i32,
+    layer_sliding: *const u8,
+}
+
+/// Inkling 2's integer-dot NVFP4 expert rows against the same rows decoded to floats, on random
+/// data: the largest error over the outputs' RMS (None: this build has no integer path).
+pub fn ink2_sdot_error() -> Option<f64> {
+    let e = unsafe { sk_ink2_sdot_error() };
+    (e >= 0.0).then_some(e)
+}
+
+/// How a layer's experts are stored (`SK_XFMT_*`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExpertFmt {
+    Nvfp4 = 0,
+    Mxfp8 = 1,
+    Bf16 = 2,
+}
+
 #[repr(C)]
 struct SkStepPlan {
     n_tokens: i32,
@@ -358,6 +460,21 @@ pub struct StepStats {
 extern "C" {
     fn sk_exec_create_k3(dims: *const SkK3Dims, opts: *const ExecOpts, err: *mut c_char, n: i32) -> *mut SkExec;
     fn sk_exec_create_dense(dims: *const SkDenseDims, opts: *const ExecOpts, err: *mut c_char, n: i32) -> *mut SkExec;
+    fn sk_exec_create_ink2(dims: *const SkInk2Dims, opts: *const ExecOpts, err: *mut c_char, n: i32) -> *mut SkExec;
+    fn sk_exec_set_ink2_experts(
+        e: *mut SkExec,
+        layer: i32,
+        fmt: i32,
+        w13: *const u8,
+        w13_scale: *const u8,
+        w13_factor: *const f32,
+        w2: *const u8,
+        w2_scale: *const u8,
+        w2_factor: *const f32,
+        err: *mut c_char,
+        n: i32,
+    ) -> i32;
+    fn sk_ink2_sdot_error() -> f64;
     fn sk_exec_destroy(e: *mut SkExec);
     fn sk_exec_add_matrix(
         e: *mut SkExec,
@@ -462,6 +579,25 @@ extern "C" {
     fn sk_exec_slot_bytes(e: *const SkExec) -> usize;
     fn sk_exec_save_slot(e: *mut SkExec, slot: i32, dst: *mut u8, err: *mut c_char, n: i32) -> i32;
     fn sk_exec_load_slot(e: *mut SkExec, slot: i32, src: *const u8, err: *mut c_char, n: i32) -> i32;
+    fn sk_exec_drop_tail(e: *mut SkExec, slot: i32, rows: i32, err: *mut c_char, n: i32) -> i32;
+    fn sk_exec_page_state_enable(e: *mut SkExec, err: *mut c_char, n: i32) -> i32;
+    fn sk_exec_set_ink2_mtp(e: *mut SkExec, cfg: *const Ink2Mtp, err: *mut c_char, n: i32) -> i32;
+    fn sk_exec_ink2_has_draft(e: *const SkExec) -> i32;
+    #[allow(clippy::too_many_arguments)]
+    fn sk_exec_ink2_draft(
+        e: *mut SkExec,
+        n: i32,
+        slots: *const i32,
+        next: *const i32,
+        pos: *const i32,
+        page_table: *const i32,
+        k: i32,
+        out: *mut i32,
+        conf: *mut f32,
+        err: *mut c_char,
+        len: i32,
+    ) -> i32;
+    fn sk_exec_page_state_load(e: *mut SkExec, slot: i32, page: i32, err: *mut c_char, n: i32) -> i32;
     fn sk_exec_page_bytes(e: *const SkExec) -> usize;
     fn sk_exec_reserve_host_pages(e: *mut SkExec, n: i64, err: *mut c_char, len: i32) -> i32;
     fn sk_exec_copy_pages(
@@ -723,6 +859,84 @@ impl Executor {
             Some(raw) => Ok(Executor::wrap(raw, opts)),
             None => Err(err_string(&err)),
         }
+    }
+
+    pub fn new_ink2(d: &Ink2Dims, opts: &ExecOpts) -> Result<Self, String> {
+        if d.layer_sliding.len() != d.n_layers as usize {
+            return Err("layer_sliding must have n_layers entries".into());
+        }
+        let raw = SkInk2Dims {
+            hidden: d.hidden,
+            n_layers: d.n_layers,
+            vocab: d.vocab,
+            out_vocab: d.out_vocab,
+            rms_eps: d.rms_eps,
+            full_hq: d.full.0,
+            full_hk: d.full.1,
+            full_d: d.full.2,
+            swa_hq: d.swa.0,
+            swa_hk: d.swa.1,
+            swa_d: d.swa.2,
+            window: d.window,
+            d_rel: d.d_rel,
+            rel_extent: d.rel_extent,
+            log_n_floor: d.log_n_floor,
+            log_alpha: d.log_alpha,
+            qk_clip: d.qk_clip,
+            rel_clip: d.rel_clip,
+            conv_k: d.conv_k,
+            block: d.block,
+            n_experts: d.n_experts,
+            topk: d.topk,
+            moe_inter: d.moe_inter,
+            gate_softcap: d.gate_softcap,
+            up_softcap: d.up_softcap,
+            route_scale: d.route_scale,
+            logit_softcap: d.logit_softcap,
+            loop_start: d.loop_start,
+            loop_end: d.loop_end,
+            passes: d.passes,
+            gate_rank: d.gate_rank,
+            layer_sliding: d.layer_sliding.as_ptr(),
+        };
+        let mut err = err_buf();
+        // SAFETY: raw (and layer_sliding, copied by the callee) outlive the call.
+        let p = unsafe { sk_exec_create_ink2(&raw, opts, err.as_mut_ptr(), ERR_LEN as i32) };
+        NonNull::new(p).map(|raw| Executor::wrap(raw, opts)).ok_or_else(|| err_string(&err))
+    }
+
+    /// A layer's experts, read in place (Inkling 2): the stacks of every expert's gate/up and down
+    /// matrices, their scales, and for NVFP4 a factor per expert.
+    ///
+    /// # Safety
+    /// The slices' memory must outlive the executor and hold the model's shapes in `fmt`.
+    #[allow(clippy::too_many_arguments)]
+    pub unsafe fn set_ink2_experts(
+        &mut self,
+        layer: usize,
+        fmt: ExpertFmt,
+        w13: &[u8],
+        w13_scale: Option<&[u8]>,
+        w13_factor: Option<&[f32]>,
+        w2: &[u8],
+        w2_scale: Option<&[u8]>,
+        w2_factor: Option<&[f32]>,
+    ) -> Result<(), String> {
+        let mut err = err_buf();
+        let rc = sk_exec_set_ink2_experts(
+            self.raw.as_ptr(),
+            layer as i32,
+            fmt as i32,
+            w13.as_ptr(),
+            w13_scale.map_or(std::ptr::null(), |s| s.as_ptr()),
+            w13_factor.map_or(std::ptr::null(), |s| s.as_ptr()),
+            w2.as_ptr(),
+            w2_scale.map_or(std::ptr::null(), |s| s.as_ptr()),
+            w2_factor.map_or(std::ptr::null(), |s| s.as_ptr()),
+            err.as_mut_ptr(),
+            ERR_LEN as i32,
+        );
+        Self::check(rc, &err)
     }
 
     fn check(rc: i32, err: &[c_char]) -> Result<(), String> {
@@ -1163,6 +1377,80 @@ impl Executor {
         let mut err = err_buf();
         let rc = unsafe {
             sk_exec_load_slot(self.raw.as_ptr(), slot as i32, src.as_ptr(), err.as_mut_ptr(), ERR_LEN as i32)
+        };
+        Self::check(rc, &err)
+    }
+
+    /// The last `rows` rows of `slot`'s segment in the last step are void (rejected drafts): an
+    /// executor with per-sequence state besides the paged cache puts it back.
+    pub fn drop_tail(&mut self, slot: usize, rows: usize) -> Result<(), String> {
+        let mut err = err_buf();
+        let rc =
+            unsafe { sk_exec_drop_tail(self.raw.as_ptr(), slot as i32, rows as i32, err.as_mut_ptr(), ERR_LEN as i32) };
+        Self::check(rc, &err)
+    }
+
+    /// Before `finalize`: the model has a draft head (its tensors are added as "mtp.*").
+    pub fn set_ink2_mtp(&mut self, cfg: &Ink2Mtp) -> Result<(), String> {
+        let mut err = err_buf();
+        let rc = unsafe { sk_exec_set_ink2_mtp(self.raw.as_ptr(), cfg, err.as_mut_ptr(), ERR_LEN as i32) };
+        Self::check(rc, &err)
+    }
+
+    /// Whether Inkling 2's draft head drafts (after `finalize`).
+    pub fn ink2_has_draft(&self) -> bool {
+        unsafe { sk_exec_ink2_has_draft(self.raw.as_ptr()) != 0 }
+    }
+
+    /// After a step: `k` drafts for each sequence (slot, the token sampled after its last position,
+    /// its length), and each draft's probability under the head given the ones before it.
+    pub fn ink2_draft(
+        &mut self,
+        slots: &[i32],
+        next: &[i32],
+        pos: &[i32],
+        page_table: &[i32],
+        k: usize,
+    ) -> Result<(Vec<i32>, Vec<f32>), String> {
+        let n = slots.len();
+        if next.len() != n || pos.len() != n {
+            return Err("draft: one token and one length a sequence".into());
+        }
+        let mut out = vec![0i32; n * k];
+        let mut conf = vec![0f32; n * k];
+        let mut err = err_buf();
+        let rc = unsafe {
+            sk_exec_ink2_draft(
+                self.raw.as_ptr(),
+                n as i32,
+                slots.as_ptr(),
+                next.as_ptr(),
+                pos.as_ptr(),
+                page_table.as_ptr(),
+                k as i32,
+                out.as_mut_ptr(),
+                conf.as_mut_ptr(),
+                err.as_mut_ptr(),
+                ERR_LEN as i32,
+            )
+        };
+        Self::check(rc, &err).map(|_| (out, conf))
+    }
+
+    /// Before `finalize`: keep, for every cache page a sequence fills, the per-sequence state
+    /// besides the cache as it is after the page's last position (what the prefix cache needs to
+    /// start another sequence there). Refused by executors without such state.
+    pub fn page_state_enable(&mut self) -> Result<(), String> {
+        let mut err = err_buf();
+        let rc = unsafe { sk_exec_page_state_enable(self.raw.as_ptr(), err.as_mut_ptr(), ERR_LEN as i32) };
+        Self::check(rc, &err)
+    }
+
+    /// `slot`'s state becomes the one kept for `page`: its next token follows the page.
+    pub fn page_state_load(&mut self, slot: usize, page: u32) -> Result<(), String> {
+        let mut err = err_buf();
+        let rc = unsafe {
+            sk_exec_page_state_load(self.raw.as_ptr(), slot as i32, page as i32, err.as_mut_ptr(), ERR_LEN as i32)
         };
         Self::check(rc, &err)
     }
