@@ -61,6 +61,7 @@
 #include "kernels/kimi.cuh"
 #include "kernels/kda_chunk.cuh"
 #include "kernels/mla.cuh"
+#include "kernels/attention_kv4.cuh"  // before attention.cuh: qk_rope_append writes the int4 cache's ring
 #include "kernels/attention.cuh"
 #include "kernels/sampling.cuh"
 #include "kernels/moe.cuh"
@@ -184,6 +185,9 @@ public:
         SK_CUDA(cudaFuncSetAttribute(gqa_attn_tc_kernel<4, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                                      static_cast<int>(atc_smem<4, true>())),
                 "attention smem");
+        SK_CUDA(cudaFuncSetAttribute(gqa_attn_kv4_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                     static_cast<int>(kv4_smem())),
+                "attention smem");
         SK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&occ, moe_gemm_kernel<true>, kGeThreads, kGeSmem),
                 "occupancy");
         ge_blocks_ = sm_count_ * std::max(occ, 1);
@@ -200,8 +204,9 @@ public:
         cudaStreamSynchronize(s_);
         for (Scratch *s : {&wbf_, &xbf_, &part_, &moe_route_, &argmax_part_, &sample_w_, &lp_part_, &router_, &xb16_, &moe16_, &moe_xs_,
                            &moe_g16_, &moe_dn_, &cutlass_args_, &cutlass_ws_, &fmha_k_, &fmha_v_, &fmha_q_, &fmha_o_,
-                           &fmha_lse_, &fmha_ws_, &twin_y_, &twin_q_, &fa3_meta_, &fa3_sched_, &fa3_lse_, &fa3_oacc_, &fa3_lseacc_, &fa3_q8_, &fa3_sems_, &qkv_buf_, &twin_a_,
-                           &moe_sfa_, &xh16_, &xh_trunk_, &kv8_k_, &kv8_v_, &kv8_src_, &kv8_pt_, &xq8_, &sx8_, &lt_acc_,
+                           &fmha_lse_, &fmha_ws_, &twin_y_, &twin_q_, &fa3s_[0].meta, &fa3s_[0].sched, &fa3s_[0].sems, &fa3s_[1].meta, &fa3s_[1].sched, &fa3s_[1].sems,
+                           &fa3_lse_, &fa3_oacc_, &fa3_lseacc_, &fa3_q8_, &qkv_buf_, &twin_a_,
+                           &moe_sfa_, &xh16_, &xh_trunk_, &kv8_k_, &kv8_v_, &kv8_src_, &kv8_pt_, &kv4_rows_, &xq8_, &sx8_, &lt_acc_,
                            &sm_w13_, &sm_s13_, &sm_w2_, &sm_s2_, &sm_xq_, &sm_sx_, &sm_d13_, &sm_aq_, &sm_sa_, &lora_xa_, &lora_part_, &prompt_,
                            &mla_lse_, &mla_acc_, &mla_sched_})
             if (s->p) cudaFree(s->p);
@@ -232,6 +237,7 @@ public:
         if (bx_) {  // the fp8 caches' kernels take 16-bit activations
             c.kv_formats |= kv_bit(DType::FP8);
             if (kt_.fa3_fp8) c.kv_formats |= kv_bit(DType::FP8E4M3);  // FA3 (head_dim 128)
+            if (kt_.fa3_at(128)) c.kv_formats |= kv_bit(DType::KV4);  // its prompt chunks: bf16 FA3 (head_dim 128)
         }
         c.kv8_page_multiple = 16;
         c.families = FAM_ALL;
@@ -1163,6 +1169,10 @@ public:
         // fewer, longer splits (each of its warps streams whole tiles)
         static const bool no_tc = tc_env("FULLM_NO_ATTN_TC", 0) != 0;
         if (kv_dtype == DType::FP8E4M3) cuda_fail("gqa_attention", "plain e4m3 cache: FlashAttention-3 reads it (gqa_prefill)");
+        if (kv_dtype == DType::KV4) {  // the int4 cache (attention_kv4.cuh)
+            kv4_decode(o, q, kc, vc, 0, N, tok_slot, tok_pos, page_table, max_pages, page, Hq, Hkv, D, max_pos, scale);
+            return;
+        }
         const bool f8 = kv_dtype == DType::FP8;
         if (f8 && (!bx_ || (D != 64 && D != 128) || G > 16 || page % 16))
             cuda_fail("gqa_attention", "fp8 cache: bf16 activations, head_dim 64 or 128, <= 16 heads per group, 16-multiple pages");
@@ -1239,6 +1249,9 @@ public:
                     int64_t Hkv, int64_t D, int64_t max_pos, float scale) override {
         static const bool off = tc_env("FULLM_NO_PREFILL_ATTN", 0) != 0;
         twin_clear(o);  // o is about to be rewritten (the FMHA paths register their own copy)
+        if (kv_dtype == DType::KV4)  // every row: the ring's rows of long runs are written there
+            return kv4_prefill(o, q, kc, vc, h_segs, n_segs, n_dec, tok_slot, tok_pos, page_table, max_pages, page, Hq, Hkv, D,
+                               max_pos, scale);
         const int64_t G = Hq / Hkv;
         if (off || !bx_ || Hq % Hkv || G > 8 || (D != 64 && D != 128)) return 0;  // exact: the fp32 kernel
         bind();
@@ -1271,6 +1284,39 @@ public:
             if (!kt_.fa3_fp8_at(D))
                 cuda_fail("gqa_prefill", "the fp8 cache needs FlashAttention-3 (the cutlass feature) and head_dim 128");
             if (n_segs <= 0 && n_dec <= 0) return 2;
+            // Long prompt chunks over bf16 staging pages and the 16-bit kernel (the e4m3 values exact,
+            // Q and P in bf16: the HiLo kernel's accuracy without its two extra GEMMs, which a chunk
+            // pays in full: 570 against 760 us for 4 x 512 queries over 10k positions), from the first
+            // chunk of fa3_stage_min_ tokens on (the planner orders a step: decoding rows, draft
+            // checks, prompt chunks); the rows and draft checks before it stay on the e4m3 pages (a
+            // draft check staged would copy its whole context for a few queries).
+            int64_t fl = n_segs;
+            for (int64_t i = 0; i < n_segs && fa3_stage_min_ > 0 && kt_.fa3_at(D); ++i)
+                if (h_segs[4 * i + 1] >= fa3_stage_min_) {
+                    fl = i;
+                    break;
+                }
+            if (fl < n_segs) {
+                const int64_t N = int64_t{h_segs[4 * (n_segs - 1)]} + h_segs[4 * (n_segs - 1) + 1];
+                if ((n_dec > 0 || fl > 0) && !fa3_prefill(o, q, kc, vc, true, h_segs, fl, n_dec, tok_slot, tok_pos, page_table,
+                                                          max_pages, page, Hq, Hkv, D, max_pos, scale, 0, N, false))
+                    cuda_fail("gqa_prefill", "FlashAttention-3 declined an fp8 step's rows");
+                const int64_t ns = kv8_stage(h_segs + 4 * fl, n_segs - fl, max_pages, page);
+                const size_t pb = sizeof(__nv_bfloat16) * page * Hkv * D;
+                auto *kst = static_cast<__nv_bfloat16 *>(ensure(kv8_k_, pb * ns));
+                auto *vst = static_cast<__nv_bfloat16 *>(ensure(kv8_v_, pb * ns));
+                launch_pdl(kv8e_stage_kernel, dim3(static_cast<unsigned>(ns), 2), dim3(256), 0, s_, kst, vst,
+                           static_cast<const uint8_t *>(kc), static_cast<const uint8_t *>(vc), (const int32_t *)kv8_src_.p,
+                           page_table, page, Hkv, D);
+                SK_LAUNCH("gqa_prefill/fp8 stage");
+                const int64_t pool_pages = kv_pages_;
+                kv_pages_ = ns;  // the staging pool is the launch's page pool
+                const bool done = fa3_prefill(o, q, kst, vst, false, h_segs + 4 * fl, n_segs - fl, 0, tok_slot, tok_pos,
+                                              (const int32_t *)kv8_pt_.p, max_pages, page, Hq, Hkv, D, max_pos, scale, 1, N, true);
+                kv_pages_ = pool_pages;
+                if (!done) cuda_fail("gqa_prefill", "FlashAttention-3 declined an fp8 step's staged chunks");
+                return 2;
+            }
             if (!fa3_prefill(o, q, kc, vc, true, h_segs, n_segs, n_dec, tok_slot, tok_pos, page_table, max_pages, page, Hq,
                              Hkv, D, max_pos, scale))
                 cuda_fail("gqa_prefill", "FlashAttention-3 declined an fp8 step");
@@ -1331,12 +1377,28 @@ public:
         float *qo = q16 ? nullptr : q;
         if (q16) SK_CUDA(cudaMemsetAsync(q16 + N * Hq * D, 0, sizeof(uint16_t) * 8 * Hq * D, s_), "q twin pad");
         // decoding rows over FlashAttention-3's fp8 cache: q also as e4m3, FA3's operand, rounded
-        // from the same fp32 values its conversion kernel would read (the same bits, a launch fewer)
+        // from the same fp32 values its conversion kernel would read (the same bits, a launch fewer),
+        // and its rounding error as the second e4m3 query (fa3_hilo_), N * Hq * D bytes after
         q8_ = Q8{};
         uint8_t *q8 = nullptr;
+        int64_t q8lo = 0;
         if (!q16 && kv_dtype == DType::FP8E4M3 && kt_.fa3_fp8_at(D)) {
-            q8 = static_cast<uint8_t *>(ensure(fa3_q8_, N * Hq * D));
-            q8_ = Q8{q, N, q8};
+            q8lo = fa3_hilo_ ? N * Hq * D : 0;
+            q8 = static_cast<uint8_t *>(ensure(fa3_q8_, N * Hq * D + q8lo));
+            q8_ = Q8{q, N, q8, q8lo};
+        }
+        // the int4 cache: keys and values to the step's bf16 rows (pt null), then into the pool's pages
+        // the step fills and the ring (kv4_page_kernel, kv4_ring_kernel)
+        void *const kpool = kc, *const vpool = vc;
+        const int32_t *const pt_in = page_table;
+        __nv_bfloat16 *kr4 = nullptr, *vr4 = nullptr;
+        Kv4Ring k4{};
+        if (kv_dtype == DType::KV4) {
+            kv4_check(page, D, "qk_rope_append");
+            kr4 = static_cast<__nv_bfloat16 *>(ensure(kv4_rows_, sizeof(__nv_bfloat16) * 2 * N * Hkv * D));
+            vr4 = kr4 + N * Hkv * D;
+            k4 = Kv4Ring{static_cast<uint8_t *>(kc), static_cast<uint8_t *>(vc), kv4_ring_offset(kv_pages_, Hkv)};
+            kc = kr4, vc = vr4, page_table = nullptr;
         }
         const dim3 grid(static_cast<unsigned>(N), static_cast<unsigned>(ceil_div(Hq + Hkv, 8)));
         const int hq = static_cast<int>(Hq), hk = static_cast<int>(Hkv);
@@ -1344,11 +1406,11 @@ public:
     if (in16)                                                                                                              \
         launch_pdl(qk_rope_append_kernel<DR, KT, uint16_t>, grid, dim3(256), 0, s_, qo, qi, ki, vi, static_cast<KT *>(kc), \
                    static_cast<KT *>(vc), q_norm, k_norm, eps, inv_freq, tok_slot, tok_pos, page_table, max_pages, page, hq, \
-                   hk, q16, ldq, ldkv, q8);                                                                                \
+                   hk, q16, ldq, ldkv, q8, q8lo, k4);                                                                      \
     else                                                                                                                   \
         launch_pdl(qk_rope_append_kernel<DR, KT, float>, grid, dim3(256), 0, s_, qo, (const float *)q, k, v,               \
                    static_cast<KT *>(kc), static_cast<KT *>(vc), q_norm, k_norm, eps, inv_freq, tok_slot, tok_pos,          \
-                   page_table, max_pages, page, hq, hk, q16, int64_t{hq} * D, int64_t{hk} * D, q8)
+                   page_table, max_pages, page, hq, hk, q16, int64_t{hq} * D, int64_t{hk} * D, q8, q8lo, k4)
 #define SK_QKR_D(KT)                \
     switch (D / 32) {               \
         case 1: SK_QKR(1, KT); break; \
@@ -1363,13 +1425,105 @@ public:
             SK_QKR_D(uint8_t)
         } else if (kv_dtype == DType::FP8E4M3) {
             SK_QKR_D(__nv_fp8_e4m3)
+        } else if (kv_dtype == DType::KV4) {
+            SK_QKR(4, Kv4Rows);
         } else {
             SK_QKR_D(__nv_bfloat16)
         }
 #undef SK_QKR_D
 #undef SK_QKR
         SK_LAUNCH("qk_rope_append");
+        if (kv_dtype == DType::KV4) {  // the pages the step fills (the ring: kv4_append_row, kv4_prefill)
+            const dim3 g4(static_cast<unsigned>(N), static_cast<unsigned>(ceil_div(Hkv, int64_t{4})));
+            launch_pdl(kv4_page_kernel, g4, dim3(128), 0, s_, static_cast<uint8_t *>(kpool), static_cast<uint8_t *>(vpool),
+                       kv4_ring_offset(kv_pages_, Hkv), (const __nv_bfloat16 *)kr4, (const __nv_bfloat16 *)vr4, tok_slot, tok_pos,
+                       pt_in, max_pages, static_cast<int>(N), static_cast<int>(Hkv));
+            SK_LAUNCH("qk_rope_append/kv4 pages");
+        }
         return true;
+    }
+    // ---------------------------------------------------------------- the int4 cache (kv_int4.h)
+    void kv4_check(int64_t page, int64_t D, const char *op) {
+        if (page != kKv4Page || D != kKv4D) cuda_fail(op, "int4 cache: head_dim 128, pages of 16 positions");
+        if (kv_pages_ <= 0) cuda_fail(op, "int4 cache: the pool's page count is not set (set_kv_pages)");
+    }
+    // decode attention of rows [row0, row0 + rows) over the int4 cache (their own pages from the ring)
+    void kv4_decode(float *o, const float *q, const void *kc, const void *vc, int64_t row0, int64_t rows,
+                    const int32_t *tok_slot, const int32_t *tok_pos, const int32_t *page_table, int64_t max_pages, int64_t page,
+                    int64_t Hq, int64_t Hkv, int64_t D, int64_t max_pos, float scale) {
+        if (rows <= 0) return;
+        kv4_check(page, D, "gqa_attention");
+        const int64_t G = Hq / Hkv;
+        if (Hq % Hkv || G > 16) cuda_fail("gqa_attention", "int4 cache: <= 16 query heads per kv head");
+        materialize(o);  // rows of o another launch wrote (lazily) stay
+        twin_clear(o);
+        materialize(q);
+        // splits per (row, kv head), one block each: the least waves of the kernel's 3 blocks per SM
+        // times a split's length plus its merge (~64 positions' worth)
+        const int64_t P = rows * Hkv, slots = 3 * int64_t{sm_count_}, ctx = max_pos + 1, end = row0 + rows;
+        int ms = 1;
+        double best = 1e30;
+        for (int z = 1; z <= kAttnMaxSplits && (z == 1 || ctx / z >= kAttnSplitLen); ++z) {
+            const double c = double(ceil_div(P * z, slots)) * (double(ctx) / z + 64.0);
+            if (c < best) best = c, ms = z;
+        }
+        if (rows > kGemvMaxRows) {
+            const int64_t per_split = end * Hq * (D + 2) * static_cast<int64_t>(sizeof(float));
+            ms = static_cast<int>(std::clamp<int64_t>((int64_t{256} << 20) / per_split, 1, int64_t{ms}));
+        }
+        if (end * Hkv > kAttnCounters) ms = 1;  // the splits merge themselves through the counters
+        const int zs = static_cast<int>(std::min<int64_t>(ms, (max_pos + kAttnSplitLen) / kAttnSplitLen));
+        float *part = zs > 1 ? static_cast<float *>(ensure(part_, sizeof(float) * end * Hq * zs * (D + 2))) : nullptr;
+        bind();
+        launch_pdl(gqa_attn_kv4_kernel, dim3(static_cast<unsigned>(rows), static_cast<unsigned>(Hkv), static_cast<unsigned>(zs)),
+                   dim3(kKv4Warps * 32), kv4_smem(), s_, o, part, zs > 1 ? attn_count_ : nullptr, q,
+                   static_cast<const uint8_t *>(kc), static_cast<const uint8_t *>(vc), kv4_ring_offset(kv_pages_, Hkv), tok_slot,
+                   tok_pos, page_table, max_pages, static_cast<int>(row0), static_cast<int>(Hq), static_cast<int>(Hkv),
+                   scale * 1.4426950408889634f, ms, zs, atc_split_len_);
+        SK_LAUNCH("gqa_attention/kv4");
+    }
+    // A step over the int4 cache: the prompt chunks (segments longer than a page) through bf16
+    // staging pages and FlashAttention-3, from the first such chunk to the last (the planner orders a
+    // step: decoding rows, prompt chunks, then draft checks); the rows before and after that span
+    // (decoding rows, short segments: drafts) through the decode kernel. Every row: returns 2.
+    int kv4_prefill(float *o, const float *q, const void *kc, const void *vc, const int32_t *h_segs, int64_t n_segs,
+                    int64_t n_dec, const int32_t *tok_slot, const int32_t *tok_pos, const int32_t *page_table, int64_t max_pages,
+                    int64_t page, int64_t Hq, int64_t Hkv, int64_t D, int64_t max_pos, float scale) {
+        kv4_check(page, D, "gqa_prefill");
+        const int64_t N = n_segs > 0 ? int64_t{h_segs[4 * (n_segs - 1)]} + h_segs[4 * (n_segs - 1) + 1] : n_dec;
+        int64_t fl = -1, ll = -1;
+        for (int64_t i = 0; i < n_segs; ++i)
+            if (h_segs[4 * i + 1] > kKv4Page) ll = i, fl = fl < 0 ? i : fl;
+        if (fl < 0) {
+            kv4_decode(o, q, kc, vc, 0, N, tok_slot, tok_pos, page_table, max_pages, page, Hq, Hkv, D, max_pos, scale);
+            return 2;
+        }
+        const int64_t r0 = h_segs[4 * fl], r1 = int64_t{h_segs[4 * ll]} + h_segs[4 * ll + 1], ns_seg = ll - fl + 1;
+        const int64_t ro = kv4_ring_offset(kv_pages_, Hkv);
+        // the rows of runs spanning 3+ pages into the ring (qk_rope_append left them: the page kernel
+        // read the ring entries they overwrite); every row again, the others with the same values
+        launch_pdl(kv4_ring_kernel, dim3(static_cast<unsigned>(N), static_cast<unsigned>(ceil_div(Hkv, int64_t{4}))), dim3(128),
+                   0, s_, const_cast<uint8_t *>(static_cast<const uint8_t *>(kc)), const_cast<uint8_t *>(static_cast<const uint8_t *>(vc)),
+                   ro, (const __nv_bfloat16 *)kv4_rows_.p, (const __nv_bfloat16 *)kv4_rows_.p + N * Hkv * D, tok_slot, tok_pos,
+                   static_cast<int>(Hkv));
+        SK_LAUNCH("gqa_prefill/kv4 ring");
+        const int64_t ns = kv8_stage(h_segs + 4 * fl, ns_seg, max_pages, page);
+        const size_t pb = sizeof(__nv_bfloat16) * page * Hkv * D;
+        auto *kst = static_cast<__nv_bfloat16 *>(ensure(kv8_k_, pb * ns));
+        auto *vst = static_cast<__nv_bfloat16 *>(ensure(kv8_v_, pb * ns));
+        launch_pdl(kv4_stage_kernel, dim3(static_cast<unsigned>(ns), static_cast<unsigned>(Hkv)), dim3(128), 0, s_, kst, vst,
+                   static_cast<const uint8_t *>(kc), static_cast<const uint8_t *>(vc), ro, (const int32_t *)kv8_src_.p,
+                   page_table, max_pages, static_cast<int>(Hkv));
+        SK_LAUNCH("gqa_prefill/kv4 stage");
+        const int64_t pool_pages = kv_pages_;
+        kv_pages_ = ns;  // the staging pool is the FMHA's page pool
+        const int done = fmha_prefill(o, q, kst, vst, h_segs + 4 * fl, ns_seg, 0, false, tok_slot, tok_pos,
+                                      (const int32_t *)kv8_pt_.p, max_pages, page, Hq, Hkv, D, max_pos, scale);
+        kv_pages_ = pool_pages;
+        if (!done) cuda_fail("gqa_prefill", "int4 cache: no bf16 prefill attention for the prompt chunks");
+        kv4_decode(o, q, kc, vc, 0, r0, tok_slot, tok_pos, page_table, max_pages, page, Hq, Hkv, D, max_pos, scale);
+        kv4_decode(o, q, kc, vc, r1, N - r1, tok_slot, tok_pos, page_table, max_pages, page, Hq, Hkv, D, max_pos, scale);
+        return 2;
     }
     bool router_softmax_fused(int32_t *idx, float *w, const Weight &W, const float *x, int64_t N, int64_t k,
                               bool renorm, const ExpertW *table, int64_t n_experts) override {
@@ -1656,7 +1810,8 @@ public:
     bool fa3_prefill(float *o, const float *q, const void *kc, const void *vc, bool kv8, const int32_t *h_segs,
                      int64_t n_segs, int64_t n_rows, const int32_t *tok_slot, const int32_t *tok_pos,
                      const int32_t *page_table, int64_t max_pages, int64_t page, int64_t Hq, int64_t Hkv, int64_t D,
-                     int64_t max_pos, float scale) {
+                     int64_t max_pos, float scale, int inst = 0, int64_t step_rows = 0, bool o_final = true) {
+        Fa3State &F = fa3s_[inst];
         const int64_t QW = Hq * D;
         const int64_t min_first = n_rows > 0 ? 0 : (n_segs > 0 ? h_segs[0] : 0);
         int64_t next = n_rows > 0 ? n_rows : min_first, n_tok = n_rows, max_q = n_rows > 0 ? 1 : 0,
@@ -1679,8 +1834,8 @@ public:
         // never in a graph, whose steps have no chunks). Both every step: a graph replay in between
         // rewrites the buffer with its rows (over an fp8 cache every decode step is one), so a step
         // whose chunks equal the last upload's must still upload them
-        auto *meta = static_cast<int32_t *>(ensure(fa3_meta_, sizeof(int32_t) * (3 * n + 1)));
-        const bool fresh = fa3_meta_dirty_ || meta != fa3_meta_dev_ || n != fa3_meta_n_;
+        auto *meta = static_cast<int32_t *>(ensure(F.meta, sizeof(int32_t) * (3 * n + 1)));
+        const bool fresh = F.meta_dirty || meta != F.meta_dev || n != F.meta_n;
         if (fresh) {
             fa3_rows_meta_kernel<<<static_cast<unsigned>(ceil_div(n_rows + 1, int64_t{128})), 128, 0, s_>>>(
                 meta, tok_pos, tok_slot, static_cast<int>(n_rows), n);
@@ -1689,39 +1844,43 @@ public:
         if (n_segs > 0) {
             // n_rows, n, then the chunks' cu_seqlens_q (their end rows, relative to the launch's
             // first row), seqused_k and slots
-            fa3_meta_host_.assign(static_cast<size_t>(3 * n_segs) + 2, 0);
-            fa3_meta_host_[0] = static_cast<int32_t>(n_rows), fa3_meta_host_[1] = n;
-            int32_t *cu = fa3_meta_host_.data() + 2, *su = cu + n_segs, *sl = su + n_segs;
+            F.meta_host.assign(static_cast<size_t>(3 * n_segs) + 2, 0);
+            F.meta_host[0] = static_cast<int32_t>(n_rows), F.meta_host[1] = n;
+            int32_t *cu = F.meta_host.data() + 2, *su = cu + n_segs, *sl = su + n_segs;
             for (int64_t j = 0; j < n_segs; ++j) {
                 cu[j] = static_cast<int32_t>(h_segs[4 * j] + h_segs[4 * j + 1] - min_first);
                 su[j] = h_segs[4 * j + 2] + h_segs[4 * j + 1];
                 sl[j] = h_segs[4 * j + 3];
             }
-            if (fresh || fa3_meta_host_ != fa3_meta_last_) {
+            if (fresh || F.meta_host != F.meta_last) {
                 // pageable sources: each copy is staged before the call returns
                 const size_t b = sizeof(int32_t) * static_cast<size_t>(n_segs);
                 SK_CUDA(cudaMemcpyAsync(meta + n_rows + 1, cu, b, cudaMemcpyHostToDevice, s_), "fa3 metadata");
                 SK_CUDA(cudaMemcpyAsync(meta + (n + 1) + n_rows, su, b, cudaMemcpyHostToDevice, s_), "fa3 metadata");
                 SK_CUDA(cudaMemcpyAsync(meta + (n + 1) + n + n_rows, sl, b, cudaMemcpyHostToDevice, s_), "fa3 metadata");
-                fa3_meta_last_ = fa3_meta_host_;
+                F.meta_last = F.meta_host;
             }
         }
-        fa3_meta_dev_ = meta, fa3_meta_n_ = n, fa3_meta_dirty_ = false;
+        F.meta_dev = meta, F.meta_n = n, F.meta_dirty = false;
         // q as bf16: RoPE's twin, else converted here (the launch's rows only); over an fp8 cache,
-        // as e4m3 (FlashAttention-3's fp8 kernel takes all three operands in e4m3)
-        const uint16_t *qtw = twin_get(q, n_tok, QW);
+        // as e4m3 (FlashAttention-3's fp8 kernel takes all three operands in e4m3) and, fa3_hilo_,
+        // its rounding error as a second e4m3 query (the kernel splits P likewise): Q and P seen to
+        // ~2^-8, not e4m3's 2^-4
+        const uint16_t *qtw = twin_get_rows(q, n_tok, QW);  // the step's rows may go past the launch's
         const uint16_t *q16 = qtw ? qtw + min_first * QW : nullptr;
-        const void *qa = q16;
-        if (kv8 && !q16 && q8_.q == q && q8_.n >= min_first + covered) {
+        const void *qa = q16, *qlo = nullptr;
+        if (kv8 && !q16 && q8_.q == q && q8_.n >= min_first + covered && (q8_.lo != 0) == fa3_hilo_) {
             qa = q8_.p + min_first * QW;  // qk_rope_append wrote it
+            if (q8_.lo) qlo = q8_.p + q8_.lo + min_first * QW;
         } else if (kv8) {
-            auto *q8 = static_cast<uint8_t *>(ensure(fa3_q8_, covered * QW));
-            const int64_t n = covered * QW;
+            const int64_t n = covered * QW, lo = fa3_hilo_ ? n : 0;
+            auto *q8 = static_cast<uint8_t *>(ensure(fa3_q8_, n + lo));
             const unsigned g = static_cast<unsigned>(std::min<int64_t>(ceil_div(n, kThreads), 4 * sm_count_));
-            if (q16) bf16_to_e4m3_kernel<<<g, kThreads, 0, s_>>>(q8, q16, n);
-            else f32_to_e4m3_kernel<<<g, kThreads, 0, s_>>>(q8, q + min_first * QW, n);
+            if (q16) bf16_to_e4m3_kernel<<<g, kThreads, 0, s_>>>(q8, q16, n, lo);
+            else f32_to_e4m3_kernel<<<g, kThreads, 0, s_>>>(q8, q + min_first * QW, n, lo);
             SK_LAUNCH("fa3/q8");
             qa = q8;
+            if (lo) qlo = q8 + lo;
         } else if (!q16) {
             auto *qb = static_cast<uint16_t *>(ensure(fmha_q_, sizeof(uint16_t) * covered * QW));
             const int64_t n4 = covered * QW / 4;
@@ -1730,9 +1889,11 @@ public:
             SK_LAUNCH("fa3/q");
             qa = q16 = qb;
         }
-        auto *o16 = static_cast<uint16_t *>(ensure(fmha_o_, sizeof(uint16_t) * n_tok * QW));
+        // a step in two launches (step_rows: its row count): one output buffer for both
+        const int64_t rows_o = std::max(n_tok, step_rows);
+        auto *o16 = static_cast<uint16_t *>(ensure(fmha_o_, sizeof(uint16_t) * rows_o * QW));
         auto *lse = static_cast<float *>(ensure(fa3_lse_, sizeof(float) * Hq * covered));
-        auto *sched = static_cast<int32_t *>(ensure(fa3_sched_, sizeof(int32_t) * fa3_ops::scheduler_ints(n)));
+        auto *sched = static_cast<int32_t *>(ensure(F.sched, sizeof(int32_t) * fa3_ops::scheduler_ints(n)));
         // few queries over long contexts split their keys across CTAs: the partials' buffers for
         // the kernel's upper bound (the metadata kernel settles each sequence's count)
         const int splits = fa3_ops::max_splits(n, static_cast<int>(max_q), static_cast<int>(max_k), static_cast<int>(Hq),
@@ -1746,18 +1907,19 @@ public:
         // the first launch computes it (and zeroes the later launches' tile counters), the rest reuse
         int32_t *sem = nullptr;
         const std::array<int64_t, 6> key{n, covered, max_q, max_k, kv8 ? 1 : 0, reinterpret_cast<int64_t>(sched)};
-        if (fa3_calls_ > 0 && fa3_calls_ < kFa3Sems && key == fa3_sched_key_) {
-            sem = static_cast<int32_t *>(fa3_sems_.p) + fa3_calls_;
+        if (F.calls > 0 && F.calls < kFa3Sems && key == F.sched_key) {
+            sem = static_cast<int32_t *>(F.sems.p) + F.calls;
         } else {
-            ensure(fa3_sems_, sizeof(int32_t) * kFa3Sems);
-            SK_CUDA(cudaMemsetAsync(fa3_sems_.p, 0, sizeof(int32_t) * kFa3Sems, s_), "fa3 tile counters");
-            fa3_calls_ = 0;
+            ensure(F.sems, sizeof(int32_t) * kFa3Sems);
+            SK_CUDA(cudaMemsetAsync(F.sems.p, 0, sizeof(int32_t) * kFa3Sems, s_), "fa3 tile counters");
+            F.calls = 0;
         }
-        fa3_sched_key_ = key, ++fa3_calls_;
+        F.sched_key = key, ++F.calls;
         fa3_ops::Prefill a{};
         a.semaphore = sem;
         a.fp8 = kv8;
         a.q = qa;
+        a.q_lo = qlo;
         a.o = o16 + min_first * QW;
         a.lse = lse;
         a.oaccum = oacc;
@@ -1785,15 +1947,18 @@ public:
         fa3_ops::prefill(a, s_);
         SK_LAUNCH("fa3");
         // every row of o written here: o stays bf16-only, the o GEMM (or GEMV) takes the twin; a
-        // mixed step keeps the fp32 rows for the decode kernel's part
-        const bool o_lazy = min_first == 0 && covered == n_tok && (n_tok * QW) % 4 == 0;
+        // mixed step keeps the fp32 rows for the decode kernel's part. Of a step in two launches the
+        // first leaves o to the second (o_final), which then holds every row before its own too.
+        if (!o_final) return true;
+        const int64_t first_o = step_rows > 0 ? 0 : min_first, cov_o = step_rows > 0 ? min_first + covered : covered;
+        const bool o_lazy = first_o == 0 && cov_o == rows_o && (rows_o * QW) % 4 == 0;
         if (!o_lazy) {
-            const int64_t n4 = covered * QW / 4;
+            const int64_t n4 = cov_o * QW / 4;
             bf16_to_f32_kernel<<<static_cast<unsigned>(std::min<int64_t>(ceil_div(n4, kThreads), 4 * sm_count_)), kThreads, 0, s_>>>(
-                o + min_first * QW, o16 + min_first * QW, n4);
+                o + first_o * QW, o16 + first_o * QW, n4);
             SK_LAUNCH("fa3/o");
         }
-        twin_set(o, n_tok, QW, o16, o_lazy);  // the o GEMM reads these rows
+        twin_set(o, rows_o, QW, o16, o_lazy);  // the o GEMM reads these rows
         return true;
     }
     // The step's attention over its decoding rows [0, n_dec) and its sequence chunks (h_segs:
@@ -2252,8 +2417,7 @@ protected:
     // the runtime's hooks (runtime.cuh)
     void step_begin() override {
         twins_clear_all();  // nothing from the last step is current
-        fa3_meta_dirty_ = true;
-        fa3_calls_ = 0;  // a new step: its first FlashAttention-3 launch computes the scheduler's metadata
+        for (Fa3State &f : fa3s_) f.meta_dirty = true, f.calls = 0;  // a new step: its first FlashAttention-3 launch computes the scheduler's metadata
     }
     void on_release(void *p) override {
         for (auto it = w8_bf16_.begin(); it != w8_bf16_.end();) {  // its bf16 copy goes with it
@@ -2315,6 +2479,7 @@ private:
         const float *q = nullptr;
         int64_t n = 0;
         const uint8_t *p = nullptr;
+        int64_t lo = 0;  // the second query's offset from p (0: none)
     } q8_;
     bool qkv_has(const void *x) const { return qkv_.b && x && (x == qkv_.q || x == qkv_.k || x == qkv_.v); }
     void qkv_materialize() {
@@ -2350,6 +2515,12 @@ private:
     const uint16_t *twin_get(const float *x, int64_t M, int64_t K) const {
         for (const auto &t : twins_)
             if (t.x == x && t.M == M && t.K == K) return t.b;
+        return nullptr;
+    }
+    // the twin of x's first M rows (or more)
+    const uint16_t *twin_get_rows(const float *x, int64_t M, int64_t K) const {
+        for (const auto &t : twins_)
+            if (t.x == x && t.M >= M && t.K == K) return t.b;
         return nullptr;
     }
     // the twin when x has no fp32 rows yet (they would be the twin widened), else null
@@ -2811,9 +2982,10 @@ private:
     std::map<W8Key, void *> w8_bf16_;
     const bool w8_cache_ = env_on("FULLM_W8_CACHE", true);
     Scratch fmha_k_, fmha_v_, fmha_q_, fmha_o_, fmha_lse_, fmha_ws_;  // the CUTLASS FMHA
-    Scratch fa3_meta_, fa3_sched_, fa3_lse_, fa3_oacc_, fa3_lseacc_;  // FlashAttention-3
+    Scratch fa3_lse_, fa3_oacc_, fa3_lseacc_;  // FlashAttention-3
     // fp8 cache, prefill: bf16 staging pages, their sources and page table (kv8_stage)
     Scratch kv8_k_, kv8_v_, kv8_src_, kv8_pt_;
+    Scratch kv4_rows_;  // the int4 cache: a step's keys and values, bf16 rows (qk_rope_append)
     std::vector<int32_t> kv8_key_;  // the chunks (and page geometry) the staging tables were built for
     int64_t kv8_ns_ = 0;
 
@@ -2851,19 +3023,33 @@ private:
         kv8_key_ = std::move(key), kv8_ns_ = ns;
         return ns;
     }
-    std::vector<int32_t> fa3_meta_host_, fa3_meta_last_;  // the chunks' metadata, and the step's last upload of it
-    void *fa3_meta_dev_ = nullptr;
-    int fa3_meta_n_ = -1;          // sequences the device metadata was built for
-    bool fa3_meta_dirty_ = true;   // the rows' part must be recomputed (a new step)
-    // FlashAttention-3 launches so far this step (the first computes the scheduler's metadata into
-    // fa3_sched_, the next kFa3Sems - 1 reuse it, each with its own zeroed tile counter in fa3_sems_)
+    // What FlashAttention-3 launches of one kind share within a step (every layer launches over the
+    // same sequences). A step over an fp8 cache may have two kinds a layer (fa3s_[0]: the rows and
+    // draft checks over the e4m3 pages; [1]: the prompt chunks over bf16 staging pages), each with
+    // its own, so neither recomputes the other's.
     static constexpr int kFa3Sems = 128;
-    int fa3_calls_ = 0;
-    std::array<int64_t, 6> fa3_sched_key_{};  // the launch the metadata was computed for
-    Scratch fa3_sems_;
+    struct Fa3State {
+        Scratch meta, sched, sems;
+        std::vector<int32_t> meta_host, meta_last;  // the chunks' metadata, and the step's last upload of it
+        void *meta_dev = nullptr;
+        int meta_n = -1;         // sequences the device metadata was built for
+        bool meta_dirty = true;  // the rows' part must be recomputed (a new step)
+        // launches so far this step (the first computes the scheduler's metadata into sched, the next
+        // kFa3Sems - 1 reuse it, each with its own zeroed tile counter in sems)
+        int calls = 0;
+        std::array<int64_t, 6> sched_key{};  // the launch the metadata was computed for
+    } fa3s_[2];
     int64_t kv_pages_ = 0;  // set_kv_pages
     WFmt expert_fmt_ = WFmt::BF16;  // set_expert_format: e4m3 experts get x as fp16 from the router
     Scratch twin_y_, twin_q_;  // bf16 twins written by add + norm and by RoPE
+    // FlashAttention-3 over an fp8 cache with Q and P each split in two e4m3 (DESIGN 5.4: Q and P
+    // rounded once to e4m3 cost agents accuracy); FULLM_FP8_HILO=0: rounded once, two GEMMs fewer
+    const bool fa3_hilo_ = env_on("FULLM_FP8_HILO", true);
+    // prompt chunks of at least this many tokens go over bf16 staging pages (gqa_prefill; 0: none)
+    const int64_t fa3_stage_min_ = [] {
+        const char *e = std::getenv("FULLM_FP8_STAGE");
+        return e && *e ? int64_t(std::atoll(e)) : int64_t{128};
+    }();
     Scratch fa3_q8_;           // e4m3 queries for FlashAttention-3 over an fp8 cache
     Scratch twin_g_[4], twin_o16_;  // bf16 results of gemm_group (y16_ok jobs) and of gemm16
     Scratch twin_a_;                // silu_glu16's bf16 output (the down projection's operand)

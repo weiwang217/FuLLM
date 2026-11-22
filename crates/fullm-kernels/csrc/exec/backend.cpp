@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "backend.h"
+#include "kv_int4.h"
 #include "kv_fp8.h"
 
 namespace fullm {
@@ -280,11 +281,16 @@ void Backend::sample_rows(int32_t *idx, int32_t *bad, const float *x, int64_t ro
     sync();
 }
 
+size_t Backend::kv_extra_bytes(DType dt, int64_t slots, int64_t Hkv, int64_t) const {
+    return dt == DType::KV4 ? static_cast<size_t>(kv4_ring_bytes(slots, Hkv)) : 0;
+}
+
 size_t Backend::kv_page_bytes(DType dt, int64_t page, int64_t Hkv, int64_t D) const {
     switch (dt) {
         case DType::FP8: return static_cast<size_t>(kv8_page_bytes(page, Hkv, D));  // values, then each row's exponents
         case DType::FP8E4M3: return static_cast<size_t>(page * Hkv * D);
         case DType::BF16: return static_cast<size_t>(page * Hkv * D) * 2;
+        case DType::KV4: return static_cast<size_t>(kv4_page_bytes(page, Hkv));
         case DType::F32: break;
     }
     return static_cast<size_t>(page * Hkv * D) * 4;

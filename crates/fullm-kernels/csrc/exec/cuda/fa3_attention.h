@@ -32,6 +32,9 @@ int max_splits(int n_seqs, int max_q, int max_k, int Hq, int Hkv, int D, int sm_
 struct Prefill {
     bool fp8;                     // q, k_cache and v_cache e4m3 (else bf16)
     const void *q;                // [total_q][Hq][D]: the sequences' rows, back to back
+    const void *q_lo;             // fp8, non-null: q's rounding error (q - e4m3(q)) as e4m3, q's layout;
+                                  // the HiLo kernel: S = q K^T + q_lo K^T, and P split likewise in
+                                  // registers, O += P V + P_lo V (two GEMMs into one accumulator each)
     uint16_t *o;                  // [total_q][Hq][D] bf16
     float *lse;                   // [Hq][total_q] fp32 scratch (the log-sum-exp per row)
     const void *k_cache;          // [num_pages][page][Hkv][D]

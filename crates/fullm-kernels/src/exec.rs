@@ -50,6 +50,8 @@ pub const DT_F32: i32 = 0;
 pub const DT_BF16: i32 = 1;
 pub const DT_FP8: i32 = 2;
 pub const DT_FP8E4M3: i32 = 3;
+/// The int4 KV cache (kv_int4.h): keys per channel over each page of 16, values rotated + per position.
+pub const DT_KV4: i32 = 4;
 /// Caps::families bits (backend.h FAM_*).
 pub const FAM_GQA: u32 = 1;
 pub const FAM_MLA: u32 = 2;

@@ -145,6 +145,11 @@ struct ModelArgs {
     /// and 2346 -> 3330 on Qwen3-30B-A3B from 80 to 256.
     #[arg(long, default_value_t = 256)]
     spec_step_tokens: usize,
+    /// Every n-gram match drafts its full share. By default a request's draft length follows how
+    /// its recent drafts held (short after rejected ones), which keeps drafts from slowing fresh
+    /// text at concurrency.
+    #[arg(long)]
+    spec_fixed: bool,
     /// Speculation only from a request's own context: no drafts from what other requests' replies
     /// said after the same tokens.
     #[arg(long)]
@@ -186,7 +191,10 @@ struct ModelArgs {
     state_dtype: CacheDtype,
     /// Attention / latent cache storage (auto = bf16; fp8 = the backend's best fp8 cache, half the
     /// bytes, changes numerics: FlashAttention-3's e4m3 pages on CUDA; fp8-token = e4m3 with a
-    /// scale per token and kv head; `fullm backends` lists each backend's caches).
+    /// scale per token and kv head; int4 = 0.64 bytes a value, for when the cache is what limits
+    /// the server: 1.8x fp8's throughput once fp8's positions no longer hold the sessions,
+    /// 15-20% slower than fp8 while they do (agent sessions with drafts); `fullm backends` lists
+    /// each backend's caches).
     #[arg(long, value_enum, default_value = "auto")]
     kv_dtype: CacheDtype,
     /// Longest sequence in positions (capped at --cache-tokens: one sequence can hold the whole
@@ -442,6 +450,11 @@ fn start(a: &ModelArgs) -> Result<(fullm::runtime::EngineHandle, Arc<dyn Tokeniz
         (None, None) => format!("default on {}", opts.backend),
     };
     tracing::info!("speculative decoding: --spec-tokens {spec_tokens} ({source})");
+    if a.kv_dtype == CacheDtype::Int4 {
+        tracing::info!(
+            "--kv-dtype int4: a capacity setting (1.5x fp8's positions); slower than fp8 while fp8's cache holds the sessions"
+        );
+    }
     let engine = Engine::new(
         model,
         EngineConfig {
@@ -452,6 +465,7 @@ fn start(a: &ModelArgs) -> Result<(fullm::runtime::EngineHandle, Arc<dyn Tokeniz
             spec_tokens,
             spec_ngram: a.spec_ngram,
             spec_step_tokens: a.spec_step_tokens,
+            spec_by_acceptance: !a.spec_fixed,
             spec_global: !a.no_spec_global,
             eagle_tokens: a.spec_eagle_tokens,
             spec_own: !a.no_spec_ngram,
@@ -572,7 +586,7 @@ fn backends(device: i32) -> Result<()> {
             .join(" ")
     };
     let kvs = |bits: u32| -> String {
-        ["f32", "bf16", "fp8-token", "fp8"]
+        ["f32", "bf16", "fp8-token", "fp8", "int4"]
             .iter()
             .enumerate()
             .filter(|(i, _)| bits & (1 << i) != 0)

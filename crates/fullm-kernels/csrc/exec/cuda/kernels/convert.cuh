@@ -31,16 +31,23 @@ __global__ void bf16_strided_to_f32_kernel(float *__restrict__ dst, const uint16
 }
 
 // e4m3 queries for FlashAttention-3 over an fp8 cache (scale 1, saturating), from the bf16 twin
-// RoPE wrote or from fp32
-__global__ void bf16_to_e4m3_kernel(uint8_t *__restrict__ dst, const uint16_t *src, int64_t n) {
+// RoPE wrote or from fp32; lo > 0: each value's rounding error too, at dst + lo (e4m3_lo)
+__global__ void bf16_to_e4m3_kernel(uint8_t *__restrict__ dst, const uint16_t *src, int64_t n, int64_t lo) {
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
-         i += static_cast<int64_t>(gridDim.x) * blockDim.x)
-        dst[i] = f2e4m3(__uint_as_float(static_cast<uint32_t>(src[i]) << 16));
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const float v = __uint_as_float(static_cast<uint32_t>(src[i]) << 16);
+        const uint8_t h = f2e4m3(v);
+        dst[i] = h;
+        if (lo) dst[lo + i] = e4m3_lo(v, h);
+    }
 }
-__global__ void f32_to_e4m3_kernel(uint8_t *__restrict__ dst, const float *src, int64_t n) {
+__global__ void f32_to_e4m3_kernel(uint8_t *__restrict__ dst, const float *src, int64_t n, int64_t lo) {
     for (int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < n;
-         i += static_cast<int64_t>(gridDim.x) * blockDim.x)
-        dst[i] = f2e4m3(src[i]);
+         i += static_cast<int64_t>(gridDim.x) * blockDim.x) {
+        const uint8_t h = f2e4m3(src[i]);
+        dst[i] = h;
+        if (lo) dst[lo + i] = e4m3_lo(src[i], h);
+    }
 }
 
 __global__ void x_to_bf16_kernel(uint16_t *__restrict__ dst, const float *src, int64_t n4) {

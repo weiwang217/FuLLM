@@ -4,9 +4,13 @@
 // for iterating on a kernel (and for `ncu` on one launch) without the minutes a model takes.
 //
 // spec: cases separated by ';', each "op key=value ...":
-//   attn  n=16 ctx=8000 kv=bf16|fp8 fa3=0|1 hq=32 hkv=4 d=128 page=16 iters=50
+//   attn  n=16 ctx=8000 kv=bf16|fp8|e4m3|int4 fa3=0|1 hq=32 hkv=4 d=128 page=16 iters=50
 //         decode attention of n rows, each over its own ctx positions (fa3=1: bf16 rows through
-//         the prefill form, FlashAttention-3, as the executor sends many long rows)
+//         the prefill form, FlashAttention-3, as the executor sends many long rows; kv=e4m3:
+//         FlashAttention-3's fp8 cache, always through it; FULLM_FP8_HILO=0 Q and P rounded once; qn=512:
+//         n prompt chunks of qn queries each instead, ending at ctx, through FlashAttention-3;
+//         kv=int4: the int4 cache written through qk_rope_append, checked against the bf16 kernel over
+//         its decoded values)
 //   moe   n=16 fmt=bf16|fp8b|int4 e=128 k=8 width=2048 inter=768 iters=20
 //         the resident experts (moe_experts) for n tokens, top-k of e random experts each
 //   gemv  n=1 fmt=bf16|int8|fp8 rows=19456 cols=2560 iters=200
@@ -24,6 +28,7 @@
 
 #include "../backend.h"
 #include "../kv_fp8.h"
+#include "../kv_int4.h"
 #include "fullm_exec.h"
 
 #include <cuda_runtime.h>
@@ -113,22 +118,41 @@ double time_ms(Backend &be, int64_t iters, F &&f) {
     return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count() / double(iters);
 }
 
+std::string attn_kv4(Backend &be, const Params &p);
 std::string attn(Backend &be, const Params &p) {
+    if (gets(p, "kv", "bf16") == "int4") return attn_kv4(be, p);
     const int64_t n = geti(p, "n", 16), ctx = geti(p, "ctx", 8000), Hq = geti(p, "hq", 32), Hk = geti(p, "hkv", 4),
-                  D = geti(p, "d", 128), page = geti(p, "page", 16), iters = geti(p, "iters", 50);
+                  D = geti(p, "d", 128), page = geti(p, "page", 16), iters = geti(p, "iters", 50), qn = geti(p, "qn", 0);
     const std::string kv = gets(p, "kv", "bf16");
-    const bool f8 = kv == "fp8", fa3 = geti(p, "fa3", 0) != 0;
-    if (!f8 && kv != "bf16") throw std::runtime_error("attn: kv=bf16|fp8");
+    const bool f8 = kv == "fp8", e4 = kv == "e4m3", fa3 = geti(p, "fa3", 0) != 0 || e4 || qn > 0;
+    if (!f8 && !e4 && kv != "bf16") throw std::runtime_error("attn: kv=bf16|fp8|e4m3");
+    if (qn > 0 && (f8 || qn > ctx)) throw std::runtime_error("attn: qn needs kv=bf16|e4m3 and qn <= ctx");
+    const int64_t N = qn > 0 ? n * qn : n;  // query rows
     const int64_t mp = (ctx + page - 1) / page, n_pages = n * mp;
     Mem m(be);
     Rng rng(7);
-    std::vector<int32_t> pt(static_cast<size_t>(n * mp)), slot(static_cast<size_t>(n)), pos(static_cast<size_t>(n));
+    std::vector<int32_t> pt(static_cast<size_t>(n * mp)), slot(static_cast<size_t>(N)), pos(static_cast<size_t>(N));
     for (int64_t i = 0; i < n * mp; ++i) pt[static_cast<size_t>(i)] = static_cast<int32_t>(i);  // slot s: pages s*mp ..
-    for (int64_t s = 0; s < n; ++s) slot[static_cast<size_t>(s)] = static_cast<int32_t>(s), pos[static_cast<size_t>(s)] = static_cast<int32_t>(ctx - 1);
+    std::vector<int32_t> tiles, segs;  // qn: each sequence's chunk, its tiles of 16
+    for (int64_t s = 0; s < n; ++s) {
+        if (qn <= 0) {
+            slot[static_cast<size_t>(s)] = static_cast<int32_t>(s), pos[static_cast<size_t>(s)] = static_cast<int32_t>(ctx - 1);
+            continue;
+        }
+        for (int64_t i = 0; i < qn; ++i)
+            slot[static_cast<size_t>(s * qn + i)] = static_cast<int32_t>(s), pos[static_cast<size_t>(s * qn + i)] = static_cast<int32_t>(ctx - qn + i);
+        for (int64_t i = 0; i < qn; i += 16)
+            tiles.push_back(static_cast<int32_t>(s * qn + i)), tiles.push_back(static_cast<int32_t>(std::min<int64_t>(16, qn - i)));
+        segs.insert(segs.end(), {static_cast<int32_t>(s * qn), static_cast<int32_t>(qn), static_cast<int32_t>(ctx - qn), static_cast<int32_t>(s)});
+    }
     // one page of random contents, copied to every page
     size_t pb;
     std::vector<uint8_t> pg;
-    if (f8) {
+    if (e4) {  // plain e4m3 pages, no NaN patterns
+        pb = static_cast<size_t>(page * Hk * D);
+        pg.resize(pb);
+        for (size_t i = 0; i < pb; ++i) pg[i] = static_cast<uint8_t>(rng.next() & 0xF7u);
+    } else if (f8) {
         pb = static_cast<size_t>(fullm::kv8_page_bytes(page, Hk, D));
         pg.resize(pb);
         for (int64_t i = 0; i < page * Hk * D; ++i) pg[static_cast<size_t>(i)] = static_cast<uint8_t>(rng.next() & 0xF7u);  // no NaN
@@ -147,26 +171,150 @@ std::string attn(Backend &be, const Params &p) {
         return d;
     };
     void *kc = pool(), *vc = pool();
-    std::vector<float> q(static_cast<size_t>(n * Hq * D));
+    std::vector<float> q(static_cast<size_t>(N * Hq * D));
     for (float &x : q) x = 0.3f * rng.uni();
     const float *qd = m.up(q);
-    float *o = static_cast<float *>(m.alloc(sizeof(float) * n * Hq * D));
+    float *o = static_cast<float *>(m.alloc(sizeof(float) * N * Hq * D));
     const int32_t *ptd = m.up(pt), *sd = m.up(slot), *pd = m.up(pos);
+    const int32_t *td = qn > 0 ? m.up(tiles) : nullptr;
     be.set_exact_activations(false);
     const float scale = 1.0f / std::sqrt(static_cast<float>(D));
-    const DType dt = f8 ? DType::FP8 : DType::BF16;
+    const DType dt = e4 ? DType::FP8E4M3 : f8 ? DType::FP8 : DType::BF16;
     const double ms = time_ms(be, iters, [&] {
+        if (qn > 0) {
+            if (be.gqa_prefill(o, qd, kc, vc, dt, td, static_cast<int64_t>(tiles.size() / 2), segs.data(), n, 0, false, sd, pd,
+                               ptd, mp, page, Hq, Hk, D, ctx - 1, scale) < 1)
+                throw std::runtime_error("attn: FlashAttention-3 declined the chunks");
+            return;
+        }
+        if (e4) {
+            if (be.gqa_prefill(o, qd, kc, vc, dt, nullptr, 0, nullptr, 0, n, true, sd, pd, ptd, mp, page, Hq, Hk, D, ctx - 1, scale) != 2)
+                throw std::runtime_error("attn: FlashAttention-3 declined the e4m3 cache");
+            return;
+        }
         if (fa3 && !f8 &&
             be.gqa_prefill(o, qd, kc, vc, dt, nullptr, 0, nullptr, 0, n, true, sd, pd, ptd, mp, page, Hq, Hk, D, ctx - 1, scale) == 2)
             return;
         be.gqa_attention(o, qd, kc, vc, dt, sd, pd, ptd, mp, page, n, Hq, Hk, D, ctx - 1, scale);
     });
     be.set_exact_activations(true);
-    const double bytes = double(n) * double(ctx) * double(Hk) * double(D) * 2.0 * (f8 ? 1.0 : 2.0);
+    const double bytes = double(n) * double(ctx) * double(Hk) * double(D) * 2.0 * (f8 || e4 ? 1.0 : 2.0);
     char b[256];
+    if (qn > 0) {  // QK^T and PV over each query's causal keys
+        const double flops = 4.0 * double(N) * double(ctx - qn / 2) * double(Hq) * double(D);
+        std::snprintf(b, sizeof b, "attn n=%lld qn=%lld ctx=%lld kv=%s (fa3 chunks): %.1f us, %.0f TFLOPS\n", static_cast<long long>(n),
+                      static_cast<long long>(qn), static_cast<long long>(ctx), kv.c_str(), ms * 1e3, flops / (ms * 1e9));
+        return b;
+    }
     std::snprintf(b, sizeof b, "attn n=%lld ctx=%lld kv=%s%s: %.1f us, %.0f GB/s of K/V\n", static_cast<long long>(n),
                   static_cast<long long>(ctx), kv.c_str(), fa3 && !f8 ? " (fa3 rows)" : "", ms * 1e3, bytes / (ms * 1e6));
     return b;
+}
+
+// The int4 cache (kv_int4.h): each sequence's ctx positions written through qk_rope_append (random
+// keys with per-channel offsets, random values), then decode attention at its last position; checked
+// (n * ctx <= 64k) against the bf16 kernel over the values the cache holds, decoded on the host.
+std::string attn_kv4(Backend &be, const Params &p) {
+    const int64_t n = geti(p, "n", 16), ctx = geti(p, "ctx", 8000), Hq = geti(p, "hq", 32), Hk = geti(p, "hkv", 4),
+                  iters = geti(p, "iters", 50), qn = geti(p, "qn", 1);  // qn: rows per sequence, its last positions (draft checks)
+    constexpr int64_t D = 128, page = 16;
+    const int64_t mp = (ctx + page - 1) / page, n_pages = n * mp;
+    const size_t pb = be.kv_page_bytes(DType::KV4, page, Hk, D), extra = be.kv_extra_bytes(DType::KV4, n, Hk, D);
+    const size_t pool_bytes = pb * size_t(n_pages) + extra;
+    Mem m(be);
+    Rng rng(7);
+    auto *kp = static_cast<uint8_t *>(m.alloc(pool_bytes)), *vp = static_cast<uint8_t *>(m.alloc(pool_bytes));
+    be.zero(kp, pool_bytes), be.zero(vp, pool_bytes);
+    be.set_kv_pages(n_pages);
+    std::vector<int32_t> pt(static_cast<size_t>(n * mp));
+    for (int64_t i = 0; i < n * mp; ++i) pt[static_cast<size_t>(i)] = static_cast<int32_t>(i);
+    const int32_t *ptd = m.up(pt);
+    const float *invd = m.up(std::vector<float>(D / 2, 0.0f));
+    be.set_exact_activations(false);
+    // the writes: chunks of up to C positions of one sequence, the same random rows each time
+    constexpr int64_t C = 4096;
+    std::vector<float> koff(static_cast<size_t>(Hk * D)), kr(static_cast<size_t>(C * Hk * D)), vr(kr.size());
+    for (float &x : koff) x = rng.uni();
+    for (size_t i = 0; i < kr.size(); ++i) kr[i] = koff[i % koff.size()] + 0.5f * rng.uni(), vr[i] = rng.uni();
+    const float *kd = m.up(kr), *vd = m.up(vr);
+    float *qw = static_cast<float *>(m.alloc(sizeof(float) * C * Hq * D));
+    int32_t *sw = static_cast<int32_t *>(m.alloc(4 * C)), *pw = static_cast<int32_t *>(m.alloc(4 * C));
+    for (int64_t s2 = 0; s2 < n; ++s2)
+        for (int64_t c0 = 0; c0 < ctx; c0 += C) {
+            const int64_t len = std::min(C, ctx - c0);
+            std::vector<int32_t> sl(static_cast<size_t>(len), int32_t(s2)), ps(static_cast<size_t>(len));
+            for (int64_t i = 0; i < len; ++i) ps[static_cast<size_t>(i)] = int32_t(c0 + i);
+            be.upload(sw, sl.data(), 4 * len), be.upload(pw, ps.data(), 4 * len);
+            be.zero(qw, sizeof(float) * len * Hq * D);
+            if (!be.qk_rope_append(qw, kd, vd, kp, vp, DType::KV4, nullptr, nullptr, 1e-6f, invd, sw, pw, ptd, mp, page, len, Hq, Hk, D))
+                throw std::runtime_error("attn: no int4 append");
+            be.sync();
+        }
+    const int64_t NR = n * qn;
+    std::vector<int32_t> slot(static_cast<size_t>(NR)), pos(static_cast<size_t>(NR));
+    for (int64_t i = 0; i < NR; ++i) slot[static_cast<size_t>(i)] = int32_t(i / qn), pos[static_cast<size_t>(i)] = int32_t(ctx - qn + i % qn);
+    std::vector<float> q(static_cast<size_t>(NR * Hq * D));
+    for (float &x : q) x = rng.uni();
+    const float *qd = m.up(q);
+    float *o4 = static_cast<float *>(m.alloc(sizeof(float) * NR * Hq * D));
+    const int32_t *sd = m.up(slot), *pd = m.up(pos);
+    const float scale = 1.0f / std::sqrt(float(D));
+    const double ms = time_ms(be, iters, [&] {
+        be.gqa_attention(o4, qd, kp, vp, DType::KV4, sd, pd, ptd, mp, page, NR, Hq, Hk, D, ctx - 1, scale);
+    });
+    std::string check = "";
+    if (n * ctx <= 65536 && qn == 1) {  // the values the cache holds as a bf16 cache, through the bf16 kernel
+        std::vector<uint8_t> kh(pool_bytes), vh(pool_bytes);
+        be.download(kh.data(), kp, pool_bytes), be.download(vh.data(), vp, pool_bytes);
+        be.sync();
+        const int64_t ro = fullm::kv4_ring_offset(n_pages, Hk);
+        std::vector<uint16_t> k16(static_cast<size_t>(n_pages * page * Hk * D)), v16(k16.size());
+        for (int64_t s2 = 0; s2 < n; ++s2) {
+            int32_t side;
+            std::memcpy(&side, kh.data() + ro + 4 * s2, 4);
+            const int32_t own = int32_t((ctx - 1) / page);
+            for (int64_t lp = 0; lp < mp; ++lp)
+                for (int64_t h = 0; h < Hk; ++h)
+                    for (int rr = 0; rr < page; ++rr) {
+                        float kx[D], vx[D];
+                        if (lp == own && lp >= side - 1) {
+                            const uint8_t *ke = kh.data() + ro + fullm::kv4_side(s2, lp & 1, h, Hk), *ve = vh.data() + ro + fullm::kv4_side(s2, lp & 1, h, Hk);
+                            for (int c = 0; c < D; ++c)
+                                kx[c] = fullm::kv4_f16(fullm::kv4_ld16(ke + 2 * fullm::kv4_kside(rr, c))),
+                                vx[c] = fullm::kv4_f16(fullm::kv4_ld16(ve + 2 * fullm::kv4_vside(rr, c)));
+                        } else {
+                            const int64_t pg = pt[static_cast<size_t>(s2 * mp + lp)];
+                            const uint8_t *kb = kh.data() + (pg * Hk + h) * fullm::kKv4Block, *vb = vh.data() + (pg * Hk + h) * fullm::kKv4Block;
+                            for (int c = 0; c < D; ++c) kx[c] = fullm::kv4_key(kb, vb, rr, c), vx[c] = fullm::kv4_value_rot(kb, vb, rr, c);
+                        }
+                        fullm::kv4_hadamard(vx);
+                        const int64_t pg = pt[static_cast<size_t>(s2 * mp + lp)];
+                        for (int c = 0; c < D; ++c) {
+                            const size_t o2 = static_cast<size_t>(((pg * page + rr) * Hk + h) * D + c);
+                            k16[o2] = bf16_of(kx[c]), v16[o2] = bf16_of(vx[c]);
+                        }
+                    }
+        }
+        const uint16_t *kb16 = m.up(k16), *vb16 = m.up(v16);
+        float *o16 = static_cast<float *>(m.alloc(sizeof(float) * n * Hq * D));
+        be.gqa_attention(o16, qd, kb16, vb16, DType::BF16, sd, pd, ptd, mp, page, n, Hq, Hk, D, ctx - 1, scale);
+        be.sync();
+        std::vector<float> a(q.size()), b(q.size());
+        be.download(a.data(), o4, sizeof(float) * a.size());
+        be.download(b.data(), o16, sizeof(float) * b.size());
+        be.sync();
+        double mabs = 0.0, mag = 0.0;
+        for (size_t i = 0; i < a.size(); ++i) mabs = std::max(mabs, double(std::fabs(a[i] - b[i]))), mag = std::max(mag, double(std::fabs(b[i])));
+        char c2[96];
+        std::snprintf(c2, sizeof c2, "; vs bf16 kernel max rel %.2e", mabs / std::max(mag, 1e-30));
+        check = c2;
+    }
+    be.set_exact_activations(true);
+    const double bytes = double(n) * double(ctx) * double(Hk) * 2.0 * double(fullm::kKv4Block) / double(page);
+    char out[256];
+    std::snprintf(out, sizeof out, "attn n=%lld qn=%lld ctx=%lld kv=int4: %.1f us, %.0f GB/s of K/V%s\n", static_cast<long long>(n),
+                  static_cast<long long>(qn), static_cast<long long>(ctx), ms * 1e3, bytes / (ms * 1e6), check.c_str());
+    return out;
 }
 
 std::string mla(Backend &be, const Params &p) {

@@ -962,11 +962,37 @@ __global__ void kv8_dequant_kernel(__nv_bfloat16 *kd, __nv_bfloat16 *vd, const u
 }
 
 
+// Plain e4m3 pages (DType::FP8E4M3: [page][Hkv][D] at scale 1) as bf16 pages for the prefill
+// attention: block (j, 0) converts staging page j's keys, (j, 1) its values, from physical page
+// ptab[src[j]]. Exact: every e4m3 value is a bf16.
+__global__ void kv8e_stage_kernel(__nv_bfloat16 *kd, __nv_bfloat16 *vd, const uint8_t *__restrict__ kc,
+                                  const uint8_t *__restrict__ vc, const int32_t *__restrict__ src,
+                                  const int32_t *__restrict__ ptab, int64_t page, int64_t Hkv, int64_t D) {
+    pdl_wait();
+    pdl_trigger();
+    const int64_t j = blockIdx.x, pb = page * Hkv * D;
+    const uint8_t *vals = (blockIdx.y ? vc : kc) + int64_t{ptab[src[j]]} * pb;
+    __nv_bfloat16 *dst = (blockIdx.y ? vd : kd) + j * pb;
+    for (int64_t i = threadIdx.x; i < pb / 8; i += blockDim.x) {
+        const uint2 b = *reinterpret_cast<const uint2 *>(vals + i * 8);
+        uint32_t w[4];
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const uint32_t pair = e4m3x2_f16x2((k < 2 ? b.x : b.y) >> (16 * (k & 1)));
+            const float2 f = __half22float2(*reinterpret_cast<const __half2 *>(&pair));
+            w[k] = bf16x2(f.x, f.y);
+        }
+        *reinterpret_cast<uint4 *>(dst + i * 8) = make_uint4(w[0], w[1], w[2], w[3]);
+    }
+}
+
 // q/k RMSNorm + RoPE + cache append: grid (token, head blocks of 8 warps), one warp per head
 // of the Hq + Hkv: query heads are normalised and rotated in place, key heads normalised,
 // rotated and written to the cache with their values. Lane holds dims lane + 32c (DR = D/32);
 // a RoPE pair (j, j + D/2) is in one lane when D >= 64, across lanes 16 apart when D = 32.
 // IT: the q/k/v input type (fp32, or the bf16 twins the GEMMs left); q null: only q16 is written.
+// pt null (bf16 / fp32 KT): the keys and values go to rows t of kc / vc, [N][Hk][D] (the int4
+// cache's step rows, quantised from there).
 // KT uint8_t: the fp8 cache (kv_fp8.h): each key and value vector's exponent from its warp-wide
 // largest magnitude, the e4m3 values, and the exponents into the page's exponent rows.
 // KT __nv_fp8_e4m3: plain e4m3 pages (DType::FP8E4M3), every value at scale 1, saturating.
@@ -976,7 +1002,7 @@ __global__ void qk_rope_append_kernel(float *q, const IT *qi, const IT *ki, cons
                                       const float *__restrict__ inv_freq, const int32_t *__restrict__ tok_slot,
                                       const int32_t *__restrict__ tok_pos, const int32_t *__restrict__ pt,
                                       int64_t max_pages, int64_t page, int Hq, int Hk, uint16_t *q16, int64_t ldq,
-                                      int64_t ldkv, uint8_t *q8) {
+                                      int64_t ldkv, uint8_t *q8, int64_t q8lo, Kv4Ring k4) {
     constexpr int D = 32 * DR;
     pdl_wait();
     pdl_trigger();
@@ -1021,14 +1047,26 @@ __global__ void qk_rope_append_kernel(float *q, const IT *qi, const IT *ki, cons
         for (int c = 0; c < DR; ++c) {
             if (qrow) qrow[lane + 32 * c] = x[c];
             if (q16r) q16r[lane + 32 * c] = f2bf(x[c]);
-            if (q8r) q8r[lane + 32 * c] = f2e4m3(x[c]);
+            if (q8r) {
+                const uint8_t hb = f2e4m3(x[c]);
+                q8r[lane + 32 * c] = hb;
+                if (q8lo) q8r[q8lo + lane + 32 * c] = e4m3_lo(x[c], hb);
+            }
         }
         return;
     }
     const int64_t p = tok_pos[t];
-    const int64_t pg = pt[static_cast<int64_t>(tok_slot[t]) * max_pages + p / page];
+    const int64_t pg = pt ? pt[static_cast<int64_t>(tok_slot[t]) * max_pages + p / page] : 0;
     const IT *vr = vi + t * ldkv + h * D;
-    if constexpr (std::is_same_v<KT, uint8_t>) {
+    if constexpr (std::is_same_v<KT, Kv4Rows>) {  // the int4 cache (attention_kv4.cuh), head_dim 128
+        if constexpr (DR == 4) {
+            float v[4];
+#pragma unroll
+            for (int c = 0; c < 4; ++c) v[c] = row_at(vr, lane + 32 * c);
+            kv4_append_row(t, h, lane, x, v, Hk, tok_slot, tok_pos, reinterpret_cast<__nv_bfloat16 *>(kc),
+                           reinterpret_cast<__nv_bfloat16 *>(vc), k4);
+        }
+    } else if constexpr (std::is_same_v<KT, uint8_t>) {
         float v[DR], ak = 0.0f, av = 0.0f;
 #pragma unroll
         for (int c = 0; c < DR; ++c) {
@@ -1056,7 +1094,8 @@ __global__ void qk_rope_append_kernel(float *q, const IT *qi, const IT *ki, cons
             v8[row + lane + 32 * c] = f2e4m3(row_at(vr, lane + 32 * c));
         }
     } else {
-        const int64_t row = (pg * page + p % page) * (static_cast<int64_t>(Hk) * D) + static_cast<int64_t>(h) * D;
+        const int64_t row = pt ? (pg * page + p % page) * (static_cast<int64_t>(Hk) * D) + static_cast<int64_t>(h) * D
+                               : (t * Hk + h) * static_cast<int64_t>(D);
 #pragma unroll
         for (int c = 0; c < DR; ++c) {
             stst(kc + row + lane + 32 * c, x[c]);

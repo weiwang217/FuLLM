@@ -25,6 +25,7 @@
 #include "int4_group.h"
 #include "kv_fp8.h"
 #include "exec_common.h"
+#include "kv_int4.h"
 
 namespace fullm {
 namespace {
@@ -50,7 +51,8 @@ public:
             throw std::runtime_error("executor options must all be positive");
         inv_freq_.assign(d.inv_freq, d.inv_freq + d.head_dim / 2);
         d_.inv_freq = nullptr;  // copied
-        kv_dt_ = o.kv_dtype == SK_DT_FP8E4M3 ? DType::FP8E4M3
+        kv_dt_ = o.kv_dtype == SK_DT_KV4       ? DType::KV4
+                 : o.kv_dtype == SK_DT_FP8E4M3 ? DType::FP8E4M3
                  : o.kv_dtype == SK_DT_FP8   ? DType::FP8
                  : o.kv_dtype == SK_DT_BF16  ? DType::BF16
                                              : DType::F32;
@@ -64,11 +66,14 @@ public:
             throw std::runtime_error(std::string("the ") + b_->name() + " backend has no grouped-query attention (dense models)");
         if (!(caps.kv_formats & kv_bit(kv_dt_)))
             throw std::runtime_error(std::string("the ") + b_->name() + " backend has no " +
-                                     (kv_dt_ == DType::F32 ? "fp32" : kv_dt_ == DType::BF16 ? "bf16" : "fp8") +
+                                     (kv_dt_ == DType::F32 ? "fp32" : kv_dt_ == DType::BF16 ? "bf16" : kv_dt_ == DType::KV4 ? "int4" : "fp8") +
                                      " KV cache" + (o.bf16_activations == 0 ? " with exact activations" : ""));
         if ((kv_dt_ == DType::FP8 || kv_dt_ == DType::FP8E4M3) && o.page % caps.kv8_page_multiple)
             throw std::runtime_error("--kv-dtype fp8 needs pages of a multiple of " + std::to_string(caps.kv8_page_multiple) +
                                      " positions");
+        if (kv_dt_ == DType::KV4 && (o.page != kKv4Page || d.head_dim != kKv4D || o.n_slots > kKv4MaxSlots))
+            throw std::runtime_error("--kv-dtype int4: head_dim 128, pages of 16 positions, at most " +
+                                     std::to_string(kKv4MaxSlots) + " sequences");
         const char *rows = std::getenv("FULLM_INT4_ROWS");
         int4_rows_ = rows ? std::atoll(rows) : b_->policy().expert_tile_max_rows;
     }
@@ -882,7 +887,7 @@ public:
         os << "dense decoder on " << b_->name() << ": weights " << double(weight_bytes_) / gb << " GB, KV cache "
            << double(kv_bytes() * 2 * d_.n_layers) / gb << " GB (" << (int64_t(o_.n_pages) * o_.page)
            << " positions, "
-           << (kv_dt_ == DType::FP8E4M3 ? "fp8 e4m3" : kv_dt_ == DType::FP8 ? "fp8, per-token scales" : kv_dt_ == DType::BF16 ? "bf16" : "f32")
+           << (kv_dt_ == DType::KV4 ? "int4" : kv_dt_ == DType::FP8E4M3 ? "fp8 e4m3" : kv_dt_ == DType::FP8 ? "fp8, per-token scales" : kv_dt_ == DType::BF16 ? "bf16" : "f32")
            << "), "
            << d_.n_heads << "/"
            << d_.n_kv_heads << " heads x " << d_.head_dim << (d_.qk_norm ? ", q/k norm" : "");
@@ -1050,8 +1055,8 @@ private:
                 b_->rmsnorm(q, q, L.q_norm, N * H, D, D, d_.rms_eps);
                 b_->rmsnorm(k, k, L.k_norm, N * Hk, D, D, d_.rms_eps);
             }
-            if (kv_dt_ == DType::FP8 || kv_dt_ == DType::FP8E4M3)
-                throw std::runtime_error("fp8 KV cache: the backend has no fused append");
+            if (kv_dt_ == DType::FP8 || kv_dt_ == DType::FP8E4M3 || kv_dt_ == DType::KV4)
+                throw std::runtime_error("fp8 / int4 KV cache: the backend has no fused append");
             b_->rope(q, d_pos_, d_inv_freq_, N, H, D, Q);
             b_->rope(k, d_pos_, d_inv_freq_, N, Hk, D, KV);
             b_->mla_append(k_pools_[l], kv_dt_, k, d_tslot_, d_pos_, d_pt_, o_.max_pages_per_seq, o_.page, KV, N);
@@ -1204,12 +1209,15 @@ private:
         // pool is then one strided block, which the host tier copies with one 2D copy per page
         // (an EAGLE-3 head's layer is one more, after the model's)
         const int kv_layers = d_.n_layers + (eagle_ ? 1 : 0);
-        const size_t stride = (kv_bytes() + 255) & ~size_t(255);
+        // (the int4 cache: each pool's ring after its pages, zeroed: its stale entries are read masked)
+        const size_t extra = b_->kv_extra_bytes(kv_dt_, o_.n_slots, d_.n_kv_heads, d_.head_dim);
+        const size_t stride = (kv_bytes() + extra + 255) & ~size_t(255);
         char *base = static_cast<char *>(b_->alloc(stride * 2 * kv_layers));
         owned_.push_back(base);
         for (int l = 0; l < kv_layers; ++l) {
             k_pools_.push_back(base + stride * (2 * l));
             v_pools_.push_back(base + stride * (2 * l + 1));
+            if (extra) b_->zero(base + stride * (2 * l) + kv_bytes(), extra), b_->zero(base + stride * (2 * l + 1) + kv_bytes(), extra);
         }
         b_->set_kv_pages(o_.n_pages);
         std::vector<void *> pools;

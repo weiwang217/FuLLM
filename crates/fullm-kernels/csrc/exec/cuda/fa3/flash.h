@@ -105,6 +105,7 @@ struct Flash_fwd_params : public Qkv_params {
     index_t vnew_head_stride;
 
     void *__restrict__ qv_ptr;
+    void *__restrict__ q_lo_ptr;  // fullm: HiLo, the second e4m3 query (q's layout)
     index_t qv_batch_stride;
     index_t qv_row_stride;
     index_t qv_head_stride;
@@ -216,7 +217,8 @@ struct Flash_bwd_params : public Flash_fwd_params {
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
 // fullm: the trailing OneMmaWG (one MMA warpgroup, the 64 x 96 decode tile; see README.md)
-template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool OneMmaWG = false>
+template <int Arch, typename T, int kHeadDim, int kHeadDimV, bool Split, bool PagedKVNonTMA, bool Has_softcap, bool PackGQA, bool OneMmaWG = false,
+          bool HiLo = false>
 void run_mha_fwd_(Flash_fwd_params &params, cudaStream_t stream);
 void prepare_varlen_num_blocks(Flash_fwd_params &params, cudaStream_t stream, bool packgqa, int blockM, int blockN, bool enable_pdl);
 template <int Arch, typename T, int kHeadDim, bool Has_softcap>

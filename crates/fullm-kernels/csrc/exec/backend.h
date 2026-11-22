@@ -36,7 +36,8 @@ enum class WFmt : int32_t { F32 = 0, BF16 = 1, INT8 = 2, FP8 = 3, FP8B = 4, INT4
 // head; CUDA backend with bf16 activations). FP8E4M3: the same cache as plain e4m3 pages,
 // [page][Hkv][D] at one scale (1) for every token: FlashAttention-3's fp8 layout, which it reads
 // for the prefill chunks and the decoding rows alike.
-enum class DType : int32_t { F32 = 0, BF16 = 1, FP8 = 2, FP8E4M3 = 3 };
+// KV4: the int4 KV cache (kv_int4.h)
+enum class DType : int32_t { F32 = 0, BF16 = 1, FP8 = 2, FP8E4M3 = 3, KV4 = 4 };
 
 // Rows at or below this take the exact-fp32 GEMV path on every backend.
 constexpr int64_t kGemvMaxRows = 16;
@@ -238,6 +239,9 @@ public:
     // The executor sizes its pools by it, so a backend whose layout differs says what it takes;
     // the base form (backend.cpp) is the layouts of backend.h's DType.
     virtual size_t kv_page_bytes(DType dt, int64_t page, int64_t Hkv, int64_t D) const;
+    // Bytes a layer's K (or V) pool takes after its pages for state of the layout's own (the int4
+    // cache's ring, kv_int4.h), zeroed by the executor; 0 for the others.
+    virtual size_t kv_extra_bytes(DType dt, int64_t slots, int64_t Hkv, int64_t D) const;
     // The format of the resident routed experts (the backend may prepare their operands for it).
     virtual void set_expert_format(WFmt) {}
 

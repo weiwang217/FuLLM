@@ -321,6 +321,15 @@ pub enum CacheDtype {
     /// e4m3 with a power-of-two scale per (token, kv head), read by fullm's own decode kernel
     /// and dequantised to bf16 for the prefill's FlashAttention-3.
     Fp8Token,
+    /// int4 pages, 0.64 bytes a value (1.56x fp8's positions): keys per channel over each page of 16
+    /// (KIVI), values rotated by a Hadamard and scaled per position, the page being filled kept
+    /// exact (fullm's own decode kernel; prompt chunks dequantised to bf16 for FlashAttention-3).
+    /// CUDA with bf16 activations and the cutlass feature, dense GQA models with head_dim 128,
+    /// pages of 16. A capacity setting, not a speed one: on an H100 (Qwen3-30B-A3B, agent sessions
+    /// with n-gram drafts) 1.8x fp8 at 32 users when both get the same 8 GB (fp8's positions no
+    /// longer hold the sessions), and 15-20% slower than fp8 where fp8's cache holds them (its decode
+    /// kernel takes a sequence's draft checks two rows a block). As accurate for agents as bf16.
+    Int4,
 }
 
 impl CacheDtype {

@@ -80,6 +80,7 @@ void prefill(const Prefill &a, cudaStream_t s) {
     p.seqlen_k_rounded = round_up(a.max_k, 128);
     // q and o: [total_q][Hq][D]; the batch strides stay 0 with cu_seqlens_q
     p.q_ptr = const_cast<void *>(a.q);
+    p.q_lo_ptr = const_cast<void *>(a.q_lo);  // fp8: HiLo
     p.q_row_stride = static_cast<int64_t>(a.Hq) * a.D;
     p.q_head_stride = a.D;
     p.o_ptr = a.o;
@@ -145,6 +146,19 @@ void prefill(const Prefill &a, cudaStream_t s) {
     // run_mha_fwd_ launches the scheduler's metadata kernel itself (skip_scheduler_metadata_computation
     // false), then the attention kernel with PDL after it
     // <Arch, T, kHeadDim, kHeadDimV, Split, PagedKVNonTMA, Has_softcap, PackGQA>
+    if (a.fp8 && a.q_lo) {  // the same with Q and P each as two e4m3 (q's second query given)
+        // <..., Split, PagedKVNonTMA, Has_softcap, PackGQA, OneMmaWG, HiLo>
+        const bool dec = decode_tile(true, a.max_q, a.Hq, a.Hkv);
+        if (p.num_splits > 1) {
+            if (dec) run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true, true, true>(p, s);
+            else run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, true, true, false, true, false, true>(p, s);
+            run_mha_fwd_combine_<cutlass::bfloat16_t, float, 128>(p, s, /*enable_pdl*/ true);
+        } else {
+            if (dec) run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true, true, true>(p, s);
+            else run_mha_fwd_<90, cutlass::float_e4m3_t, 128, 128, false, true, false, true, false, true>(p, s);
+        }
+        return;
+    }
     if (a.fp8) {  // head_dim 128 (available_fp8); the output and the partials' combine stay bf16
         // <..., Split, PagedKVNonTMA, Has_softcap, PackGQA, OneMmaWG>
         const bool dec = decode_tile(true, a.max_q, a.Hq, a.Hkv);

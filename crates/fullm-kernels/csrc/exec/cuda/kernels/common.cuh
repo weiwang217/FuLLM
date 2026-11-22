@@ -84,6 +84,11 @@ __device__ __forceinline__ float pow2_biased(int e) {  // 2^(e - 127); 0 below t
 __device__ __forceinline__ uint8_t f2e4m3(float v) {
     return static_cast<uint8_t>(__nv_cvt_float_to_fp8(v, __NV_SATFINITE, __NV_E4M3));
 }
+// v's rounding error past its e4m3 hi = f2e4m3(v), as e4m3: hi + lo holds v to ~2^-8 relative
+// (FlashAttention-3's second query, fa3_attention.h Prefill::q_lo)
+__device__ __forceinline__ uint8_t e4m3_lo(float v, uint8_t hi) {
+    return f2e4m3(v - __half2float(__half(__nv_cvt_fp8_to_halfraw(hi, __NV_E4M3))));
+}
 
 // Programmatic dependent launch (Hopper). A kernel launched with the PDL attribute may start
 // while its predecessor in the stream is still running: it may only touch data no earlier

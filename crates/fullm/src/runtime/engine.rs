@@ -187,6 +187,9 @@ pub struct EngineConfig {
     pub spec_ngram: (usize, usize),
     /// Drafts go in only while a step's decode tokens, drafts included, stay within this.
     pub spec_step_tokens: usize,
+    /// Draft lengths follow each request's acceptance (`draft_len`); off: every match drafts its
+    /// full share.
+    pub spec_by_acceptance: bool,
     /// Draft from finished replies (across requests) when a request's own context has no match.
     pub spec_global: bool,
     /// With a draft head: the most tokens it drafts for a request per step.
@@ -219,6 +222,7 @@ impl Default for EngineConfig {
             spec_tokens: 0,
             spec_ngram: (2, 4),
             spec_step_tokens: 256,
+            spec_by_acceptance: true,
             spec_global: true,
             eagle_tokens: 4,
             spec_own: true,
@@ -270,6 +274,30 @@ const RETRACT_STEPS: usize = 20;
 const KEPT_ALPHA: f32 = 0.3;
 const KEPT_START: [f32; 2] = [1.5, 1.0];
 const TRIAL_EVERY: u32 = 16;
+
+/// Draft lengths by acceptance (n-gram drafts, a request's own and other replies'). A request
+/// keeps, per source, decayed counts of the drafts it kept and of the steps a draft failed in
+/// (`ACCEPT_DECAY` a drafted step); a = kept / (kept + failures), from `ACCEPT_PRIOR`, is the chance
+/// a draft holds, and it drafts while a^k stays above a floor: `ACCEPT_FLOOR` once
+/// `ACCEPT_BUSY` requests decode (a row then costs about what it yields below that), in proportion
+/// with fewer, where a step's cost barely grows with its rows. At least one draft, which keeps the
+/// counts following the reply between copying and writing. Measured on an H100 (Qwen3-30B-A3B,
+/// int4 experts): a request keeps all 8 drafts in 59% of its drafted steps and none in 21% on agent
+/// sessions, none in 73% on fresh text, and the step before predicts the next (86% kept after a
+/// full keep, 24% after none).
+const ACCEPT_DECAY: f32 = 0.8;
+const ACCEPT_PRIOR: [f32; 2] = [2.0, 1.0];
+const ACCEPT_FLOOR: f32 = 0.3;
+const ACCEPT_BUSY: usize = 8;
+
+/// How many drafts a request with these counts ([kept, failures]) takes at this floor.
+fn draft_len(acc: [f32; 2], floor: f32) -> usize {
+    let a = (acc[0] + ACCEPT_PRIOR[0]) / (acc[0] + acc[1] + ACCEPT_PRIOR[0] + ACCEPT_PRIOR[1]);
+    if a >= 0.999 || floor <= 0.0 {
+        return usize::MAX;
+    }
+    ((floor.ln() / a.ln()) as usize).max(1)
+}
 
 /// The global continuations' longest n-gram, and how many n-grams they hold before starting over
 /// (~50 bytes each).
@@ -377,6 +405,9 @@ struct Live {
     /// from the head [1]; its decode steps since each last drafted for it.
     kept: [f32; 2],
     since: [u32; 2],
+    /// Its n-gram drafts' record (`draft_len`): [kept, failures], for its own matches [0] and for
+    /// other replies' continuations [1].
+    acc: [[f32; 2]; 2],
     /// The grammar its output follows (no drafts then; sampled on the host).
     constraint: Option<Box<dyn Constraint>>,
     /// Penalties (`SamplingParams::adjusts`): how often it generated each token, and its
@@ -854,6 +885,7 @@ impl Engine {
                 kept: KEPT_START,
                 // its first match is tried
                 since: [TRIAL_EVERY, 0],
+                acc: [[0.0; 2]; 2],
                 constraint: p.constraint,
                 counts,
                 prompt_set,
@@ -976,6 +1008,11 @@ impl Engine {
     fn add_drafts(&self, plan: &mut [Chunk], mut avail: usize) -> usize {
         let mut spare = self.cfg.spec_step_tokens.saturating_sub(plan.len());
         let share = self.draft_share(plan.len());
+        let floor = if self.cfg.spec_by_acceptance {
+            ACCEPT_FLOOR * (plan.len() as f32 / ACCEPT_BUSY as f32).min(1.0)
+        } else {
+            0.0
+        };
         for c in plan.iter_mut() {
             if spare == 0 {
                 break;
@@ -1003,9 +1040,9 @@ impl Engine {
                 _ => Vec::new(),
             };
             let d = match src {
-                Src::Own => own,
+                Src::Own => &own[..own.len().min(draft_len(l.acc[0], floor))],
                 Src::Eagle => &l.eagle[..l.eagle.len().min(want)],
-                Src::Global => &other[..],
+                Src::Global => &other[..other.len().min(draft_len(l.acc[1], floor))],
             };
             // the most the pages left can hold past the chunk's own token
             let room = (self.pages(l.fed + 1) + avail) * self.page - (l.fed + 1);
@@ -1230,6 +1267,8 @@ impl Engine {
         let (mut spec_accepted, mut spec_accepted_global, mut spec_accepted_eagle) = (0u64, 0u64, 0u64);
         // the token after each chunk's last kept position (for the draft head); None: failed
         let mut after: Vec<Option<u32>> = vec![None; plan.len()];
+        // for the trace: request:drafted:kept of each chunk with drafts
+        let mut spec_pairs = String::new();
         match result {
             Err(e) => {
                 let msg = format!("{e:#}");
@@ -1308,6 +1347,10 @@ impl Engine {
                     };
                     l.fed += 1 + n;
                     spec_accepted += n as u64;
+                    if self.trace {
+                        use std::fmt::Write;
+                        let _ = write!(spec_pairs, "{}:{}:{},", l.id, c.draft, n);
+                    }
                     let source = match c.src {
                         Src::Global => {
                             spec_accepted_global += n as u64;
@@ -1321,6 +1364,10 @@ impl Engine {
                     };
                     if let Some(x) = source {
                         l.kept[x] += KEPT_ALPHA * (n as f32 - l.kept[x]);
+                    }
+                    if c.src != Src::Eagle {
+                        let a = &mut l.acc[(c.src == Src::Global) as usize];
+                        *a = [ACCEPT_DECAY * a[0] + n as f32, ACCEPT_DECAY * a[1] + (n < c.draft) as u8 as f32];
                     }
                     if let Err(e) = self.model.accept(l.seq, n) {
                         tracing::error!(request = l.id, "{e:#}");
@@ -1379,7 +1426,7 @@ impl Engine {
                 "step gap_ms={gap_ms:.3} plan_ms={plan_ms:.3} mask_ms={mask_ms:.3} fwd_ms={ms:.3} draft_ms={draft_ms:.3} post_ms={post_ms:.3} \
                  ex_total={ex_total:.3} ex_up={ex_up:.3} ex_down={ex_down:.3} prefill={n_prefill} decode={n_decode} \
                  drafted={spec_drafted} accepted={spec_accepted} \
-                 queue_ms={queue_ms:.3} ctx={ctx} running={} waiting={} loading={} copy_wait_ms={:.3} free={} head_need={}",
+                 queue_ms={queue_ms:.3} ctx={ctx} running={} waiting={} loading={} copy_wait_ms={:.3} free={} head_need={} pairs={spec_pairs}",
                 self.running.len(),
                 self.waiting.len(),
                 self.loading,
@@ -1561,6 +1608,37 @@ enum Picks {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn draft_lengths_follow_acceptance() {
+        // a new request drafts a little, more with every draft kept, the full share after two steps
+        assert_eq!(draft_len([0.0, 0.0], ACCEPT_FLOOR), 2);
+        let mut acc = [0.0f32; 2];
+        let mut step = |k: usize, n: usize| {
+            acc = [ACCEPT_DECAY * acc[0] + n as f32, ACCEPT_DECAY * acc[1] + (n < k) as u8 as f32];
+            draft_len(acc, ACCEPT_FLOOR)
+        };
+        let k = step(2, 2);
+        assert!(k >= 4, "{k} drafts after 2 of 2 kept");
+        assert!(step(k.min(8), k.min(8)) >= 8);
+        for _ in 0..10 {
+            step(8, 8);
+        }
+        // a copying request that starts writing: back to one draft within a few steps, never none
+        let ks: Vec<usize> = (0..12).map(|_| step(8, 0)).collect();
+        assert!(ks[0] >= 8 && ks[11] == 1 && ks.windows(2).all(|w| w[1] <= w[0]), "{ks:?}");
+        // and back up once drafts hold again
+        assert!(step(1, 1) >= 1);
+        for _ in 0..6 {
+            step(4, 4);
+        }
+        assert!(step(8, 8) >= 8);
+        // fresh text (drafts rarely kept) stays at one; few decodes (a lower floor) draft longer;
+        // no floor: the full share
+        assert_eq!(draft_len([0.3, 3.0], ACCEPT_FLOOR), 1);
+        assert!(draft_len([2.0, 2.0], ACCEPT_FLOOR / 8.0) > draft_len([2.0, 2.0], ACCEPT_FLOOR));
+        assert_eq!(draft_len([0.0, 5.0], 0.0), usize::MAX);
+    }
 
     #[test]
     fn adaptive_choice_tries_both_sources_then_keeps_the_better() {

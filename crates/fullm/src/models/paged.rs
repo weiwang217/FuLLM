@@ -58,15 +58,26 @@ impl Geometry {
             "max_seqs, page and step_tokens must be positive"
         );
         ensure!(
-            !matches!(opts.state_dtype, CacheDtype::Fp8 | CacheDtype::Fp8Token),
-            "fp8 is a KV cache format, not a recurrent-state one"
+            !matches!(opts.state_dtype, CacheDtype::Fp8 | CacheDtype::Fp8Token | CacheDtype::Int4),
+            "fp8 and int4 are KV cache formats, not recurrent-state ones"
         );
         let mut kv_dt = match opts.kv_dtype {
             CacheDtype::F32 => exec::DT_F32,
             CacheDtype::Fp8 => exec::DT_FP8E4M3,
             CacheDtype::Fp8Token => exec::DT_FP8,
+            CacheDtype::Int4 => exec::DT_KV4,
             CacheDtype::Auto | CacheDtype::Bf16 => exec::DT_BF16,
         };
+        if opts.kv_dtype == CacheDtype::Int4 {
+            let caps = exec::backend_caps(opts.backend.exec_name(), opts.device, opts.bf16_activations)
+                .map_err(|e| anyhow!("{e}"))?;
+            ensure!(
+                caps.kv(exec::DT_KV4),
+                "--kv-dtype int4: the {} backend has no int4 cache (CUDA with --activations bf16 and the cutlass feature)",
+                caps.name
+            );
+            ensure!(opts.page == 16, "--kv-dtype int4 needs pages of 16 positions");
+        }
         if matches!(opts.kv_dtype, CacheDtype::Fp8 | CacheDtype::Fp8Token) {
             // the backend says which fp8 layouts it has (and on which pages), not its name: fp8 is
             // its best (FlashAttention-3's pages, else a scale per token), fp8-token that one
@@ -88,6 +99,7 @@ impl Geometry {
                     (exec::DT_BF16, "bf16"),
                     (exec::DT_FP8, "fp8-token"),
                     (exec::DT_FP8E4M3, "fp8"),
+                    (exec::DT_KV4, "int4"),
                 ]
                 .iter()
                 .filter(|(d, _)| caps.kv(*d))

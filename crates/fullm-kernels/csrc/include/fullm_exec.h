@@ -39,7 +39,8 @@ enum {
     SK_DT_F32 = 0,
     SK_DT_BF16 = 1,
     SK_DT_FP8 = 2,     /* KV cache only: e4m3 with a scale per token and kv head (kv_fp8.h) */
-    SK_DT_FP8E4M3 = 3  /* KV cache only: plain e4m3 pages, FlashAttention-3's fp8 layout */
+    SK_DT_FP8E4M3 = 3, /* KV cache only: plain e4m3 pages, FlashAttention-3's fp8 layout */
+    SK_DT_KV4 = 4      /* KV cache only: int4 pages (kv_int4.h) */
 };
 /* SK_FMT_FP8B: e4m3 with fp32 scales per 128 x 128 block; resident experts only, passed as bf16
  * and quantised by the executor (after it fixes the stored layout). SK_FMT_INT4G: int4 with an

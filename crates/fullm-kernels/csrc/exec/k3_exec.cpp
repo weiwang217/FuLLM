@@ -63,8 +63,8 @@ public:
         if (o.n_slots <= 0 || o.n_pages <= 0 || o.page <= 0 || o.max_pages_per_seq <= 0 || o.max_tokens <= 0 ||
             o.max_rows <= 0)
             throw std::runtime_error("executor options must all be positive");
-        if (o.kv_dtype == SK_DT_FP8 || o.kv_dtype == SK_DT_FP8E4M3)
-            throw std::runtime_error("--kv-dtype fp8 is for dense GQA models only");
+        if (o.kv_dtype == SK_DT_FP8 || o.kv_dtype == SK_DT_FP8E4M3 || o.kv_dtype == SK_DT_KV4)
+            throw std::runtime_error("--kv-dtype fp8 and int4 are for dense GQA models only");
         kv_dt_ = o.kv_dtype == SK_DT_BF16 ? DType::BF16 : DType::F32;
         st_dt_ = o.state_dtype == SK_DT_BF16 ? DType::BF16 : DType::F32;
         b_ = make_backend(backend_name(o.backend_name, o.backend), o.device, o.cpu_threads);

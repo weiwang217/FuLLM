@@ -28,7 +28,7 @@ It serves an OpenAI-compatible API with these features:
 | model | precisions | notes |
 |---|---|---|
 | Qwen3 dense (0.6B-8B), Llama-style dense | bf16, fp8 / int8 trunk, int4 MLP | CUDA, CPU; LoRA; EAGLE-3 heads |
-| Qwen3-30B-A3B (MoE) | experts bf16 / fp8b / int8 / int4, GPTQ int4 checkpoints; KV bf16 / fp8 | for agents: fp8b experts + bf16 KV |
+| Qwen3-30B-A3B (MoE) | experts bf16 / fp8b / int8 / int4, GPTQ int4 checkpoints; KV bf16 / fp8 / int4 | for agents: fp8b experts + bf16 KV |
 | Kimi Linear 48B-A3B (KDA + MLA hybrid) | experts bf16 / fp8b / int8 / int4 | in HBM at 8 bits or below; HBM / CPU split at bf16 |
 | Kimi K3 | MXFP4 experts in DRAM | the first layers verified against a reference; full model needs a large host |
 
@@ -119,7 +119,7 @@ Useful flags:
 |---|---|
 | `--gpu-expert-format bf16\|fp8b\|int8\|fp8\|int4` | the resident experts' format |
 | `--gpu-experts auto\|off\|GB` | how many experts live in GPU memory |
-| `--kv-dtype bf16\|fp8\|fp8-token` | the KV cache's format |
+| `--kv-dtype bf16\|fp8\|fp8-token\|int4` | the KV cache's format; `int4` is for servers limited by cache size (more users or longer contexts than `fp8` can hold): it holds 1.5x `fp8`'s positions and is slower than `fp8` when `fp8` already fits |
 | `--trunk bf16\|fp8\|int8` | the dense matrices' format |
 | `--step-tokens` | the token budget of a step |
 | `--spec-model DIR` | an EAGLE-3 head (n-gram drafts are on by default on GPUs) |
@@ -193,6 +193,23 @@ bf16:
 
 Qwen3-8B bf16, agent sessions with n-gram drafts at 16 / 32 users: +23% / +13% over vLLM and +46% / +48%
 over SGLang.
+
+### KV cache formats: when the cache is the limit
+
+Qwen3-30B-A3B with bf16 experts leaves about 8 GB for the KV cache. Agent sessions (`bench_agent`,
+~10k-token contexts, n-gram drafts) at 32 users, with the same 8 GB in each format (measured
+2026-11-21, one boot):
+
+| KV format | positions in 8 GB | output tok/s | time to first token, p50 |
+|---|---|---|---|
+| `bf16` | 81,920 | 904 | 5208 ms |
+| `fp8` | 163,840 | 1285 | 1195 ms |
+| `int4` | 245,760 | 2350 | 145 ms |
+
+`int4` holds the 32 sessions where the other two keep evicting their contexts and recomputing them: 1.8x `fp8`'s
+throughput and 2.6x `bf16`'s. Tool-calling agents are as accurate over it as over `bf16`
+(`agent_loop.py`). It is the format for when sessions no longer fit `fp8`'s positions; while they
+fit, `fp8` is the faster one.
 
 ### vs vLLM: tool-calling agents
 

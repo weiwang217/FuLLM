@@ -17,6 +17,7 @@
 #include "fp8_block.h"
 #include "int4_group.h"
 #include "kv_fp8.h"
+#include "kv_int4.h"
 #include "backend.h"
 #include "fullm_exec.h"
 
@@ -193,6 +194,13 @@ bool has_fam(Backend &b, uint32_t f) { return (b.caps().families & f) != 0; }
 bool has_kv8(Backend &b) {
     b.set_exact_activations(false);
     const bool ok = (b.caps().kv_formats & kv_bit(DType::FP8)) != 0;
+    b.set_exact_activations(true);
+    return ok;
+}
+// FlashAttention-3's fp8 cache (plain e4m3 pages), also reported with 16-bit activations only
+bool has_fa3_kv8(Backend &b) {
+    b.set_exact_activations(false);
+    const bool ok = (b.caps().kv_formats & kv_bit(DType::FP8E4M3)) != 0;
     b.set_exact_activations(true);
     return ok;
 }
@@ -1821,6 +1829,87 @@ void test_dense_attention(Report &r, Backend &cpu, Backend &gpu, Backend *loop =
             }
         }
     }
+    if (has_fa3_kv8(gpu)) {
+        // FlashAttention-3's fp8 cache (plain e4m3 pages, scale 1), its fp8 kernel with Q and P each
+        // split in two e4m3 (the value and its rounding error): the decoding rows (the 64-row tile),
+        // prefill chunks, and both in one launch, against the fp32 attention over the values the
+        // pools hold
+        std::vector<uint8_t> k8(kc.size()), v8(vc.size());
+        std::vector<float> kq(kc.size()), vq(vc.size());
+        for (size_t i = 0; i < kc.size(); ++i) {
+            k8[i] = fullm::f32_to_e4m3(kc[i]), kq[i] = fullm::e4m3_to_f32(k8[i]);
+            v8[i] = fullm::f32_to_e4m3(vc[i]), vq[i] = fullm::e4m3_to_f32(v8[i]);
+        }
+        auto run = [&](Backend &be, bool f8, const std::vector<float> &q, const std::vector<int32_t> &sl,
+                       const std::vector<int32_t> &pos, int64_t nd, float sc, int64_t nx = 0) {
+            // nd decoding rows, then (nx > 0) a draft check of nx rows, then a chunk
+            Arena ar(be);
+            const int64_t n = static_cast<int64_t>(sl.size());
+            const void *k = f8 ? static_cast<const void *>(ar.up(k8)) : static_cast<const void *>(ar.up(kq));
+            const void *v = f8 ? static_cast<const void *>(ar.up(v8)) : static_cast<const void *>(ar.up(vq));
+            const DType dt = f8 ? DType::FP8E4M3 : DType::F32;
+            float *o = static_cast<float *>(ar.zeros(sizeof(float) * n * Hq * D));
+            const float *qd = ar.up(q);
+            const int32_t *sd = ar.up(sl), *pd = ar.up(pos), *ptd = ar.up(pt);
+            const int64_t max_pos = *std::max_element(pos.begin(), pos.end());
+            be.set_exact_activations(!f8);
+            int done = 0;
+            if (nd == n) {
+                done = be.gqa_prefill(o, qd, k, v, dt, nullptr, 0, nullptr, 0, n, true, sd, pd, ptd, mp, page, Hq, Hk, D, max_pos, sc);
+            } else {
+                std::vector<int32_t> tiles;
+                for (int64_t i = nd; i < n; i += 16) tiles.push_back(int32_t(i)), tiles.push_back(int32_t(std::min<int64_t>(16, n - i)));
+                std::vector<int32_t> segs;
+                if (nx > 0) segs = {int32_t(nd), int32_t(nx), pos[size_t(nd)], sl[size_t(nd)]};
+                const int64_t c0 = nd + nx;
+                segs.insert(segs.end(), {int32_t(c0), int32_t(n - c0), pos[size_t(c0)], sl[size_t(c0)]});
+                done = be.gqa_prefill(o, qd, k, v, dt, ar.up(tiles), int64_t(tiles.size() / 2), segs.data(), int64_t(segs.size() / 4), nd, true, sd, pd,
+                                      ptd, mp, page, Hq, Hk, D, max_pos, sc);
+            }
+            if (!done) {
+                if (f8) throw std::runtime_error("FlashAttention-3 declined the fp8 cache");
+                be.gqa_attention(o, qd, k, v, dt, sd, pd, ptd, mp, page, n, Hq, Hk, D, max_pos, sc);
+            }
+            be.set_exact_activations(true);
+            return ar.down(o, static_cast<size_t>(n * Hq * D));
+        };
+        const float pscale = 1.0f / std::sqrt(static_cast<float>(D));
+        // queries large enough for peaked attention (score spread ~2, as models have): the scores'
+        // error from q rounded once to e4m3 then shows (4-7% here; 1-2% with q split, P not)
+        const float qs = 6.0f;
+        const std::vector<int32_t> dslot = {0, 1, 0, 0}, dpos = {2599, 39, 31, 2047};
+        const auto qd = rng.vec(static_cast<size_t>(dslot.size()) * Hq * D, qs);
+        const std::string dn = "gqa_attention/decode/fp8-e4m3 (FA3, split q, P)";
+        try {
+            compare(r, dn, run(cpu, false, qd, dslot, dpos, 4, pscale), run(gpu, true, qd, dslot, dpos, 4, pscale), 2.5e-2);
+        } catch (const std::exception &e) {
+            gpu.set_exact_activations(true);
+            r.error(dn, e.what());
+        }
+        // a chunk of 40 at 0 and at 2560; the decoding rows with a chunk of 160 at 2400 (long enough
+        // for the bf16 staging pages: two launches); the same with a draft check of 8 rows between
+        // (slot 1 from 40: it stays on the e4m3 pages); a chunk of 300 alone (staged, one launch)
+        for (const auto &ps : {std::array<int32_t, 5>{1, 0, 40, 0, 0}, std::array<int32_t, 5>{0, 2560, 40, 0, 0},
+                               std::array<int32_t, 5>{1, 2400, 160, 1, 0}, std::array<int32_t, 5>{0, 2400, 160, 1, 8},
+                               std::array<int32_t, 5>{0, 2100, 300, 0, 0}}) {
+            const int32_t slot = ps[0], p0 = ps[1], nc = ps[2];
+            const int64_t nx = ps[4], nd = ps[3] ? int64_t(dslot.size()) : 0, n = nd + nx + nc;
+            const auto q = rng.vec(static_cast<size_t>(n * Hq * D), qs);
+            std::vector<int32_t> sl(static_cast<size_t>(n), slot), pos(static_cast<size_t>(n));
+            for (int64_t i = 0; i < nd; ++i) sl[size_t(i)] = dslot[size_t(i)], pos[size_t(i)] = dpos[size_t(i)];
+            for (int64_t i = 0; i < nx; ++i) sl[size_t(nd + i)] = 1, pos[size_t(nd + i)] = 40 + int32_t(i);
+            for (int32_t i = 0; i < nc; ++i) pos[size_t(nd + nx + i)] = p0 + i;
+            const std::string name = std::string("gqa_prefill/") +
+                                     (nx ? "mixed+drafts" : nd ? "mixed" : nc >= 128 ? "staged" : p0 ? "long" : "short") +
+                                     "/fp8-e4m3 (FA3, split q, P)";
+            try {
+                compare(r, name, run(cpu, false, q, sl, pos, nd, pscale, nx), run(gpu, true, q, sl, pos, nd, pscale, nx), 2.5e-2);
+            } catch (const std::exception &e) {
+                gpu.set_exact_activations(true);
+                r.error(name, e.what());
+            }
+        }
+    }
     {  // the tensor-core prefill kernel (bf16 activations) against the fp32 attention
         struct PS {
             const char *name;
@@ -1970,6 +2059,208 @@ struct LoraCase {
         return js;
     }
 };
+
+// The int4 KV cache (kv_int4.h): steps written through qk_rope_append (prompt chunks, decoding rows,
+// a short prompt and drafts as rows, drafts crossing a page, a rollback rewritten, a mixed step),
+// each step's attention (gqa_prefill: chunks over bf16 staging, the rest by the decode kernel) against
+// the fp32 attention over the values the cache holds for each row (decoded on the host: the ring for
+// a row's own page per kv_int4.h's rule, else the pool), side_last, and the pool against what was
+// written (the quantiser).
+void test_kv4(Report &r, Backend &gpu) {
+    using namespace fullm;
+    gpu.set_exact_activations(false);
+    const bool has = (gpu.caps().kv_formats & kv_bit(DType::KV4)) != 0;
+    gpu.set_exact_activations(true);
+    if (!has) return;
+    constexpr int64_t Hq = 16, Hk = 2, D = 128, page = 16, slots = 3, mp = 16, n_pages = slots * mp + 2, G = Hq / Hk;
+    const size_t pb = gpu.kv_page_bytes(DType::KV4, page, Hk, D), extra = gpu.kv_extra_bytes(DType::KV4, slots, Hk, D);
+    const size_t pool_bytes = pb * n_pages + extra;
+    const int64_t ro = kv4_ring_offset(n_pages, Hk);
+    Arena ar(gpu);
+    auto *kp = static_cast<uint8_t *>(ar.zeros(pool_bytes)), *vp = static_cast<uint8_t *>(ar.zeros(pool_bytes));
+    gpu.set_kv_pages(n_pages);
+    std::vector<int32_t> pt(size_t(slots * mp));
+    for (int64_t s2 = 0; s2 < slots; ++s2)
+        for (int64_t i = 0; i < mp; ++i) pt[size_t(s2 * mp + i)] = int32_t(s2 * mp + (mp - 1 - i));  // reversed: indexing errors show
+    const int32_t *ptd = ar.up(pt);
+    // RoPE as models have it: q's rows the kernels attend with are rotated (a launch reading q's stale
+    // fp32 rows instead of RoPE's output shows), the keys rotated before they are quantised
+    std::vector<float> inv(D / 2);
+    for (int64_t j = 0; j < D / 2; ++j) inv[size_t(j)] = std::pow(10000.0f, -2.0f * float(j) / float(D));
+    const float *invd = ar.up(inv);
+    auto rope = [&](float *x, int32_t p) {  // pairs (j, j + D/2), as qk_rope_append rotates
+        for (int64_t j = 0; j < D / 2; ++j) {
+            const float a = x[j], b = x[j + D / 2], ang = float(p) * inv[size_t(j)];
+            x[j] = a * std::cos(ang) - b * std::sin(ang), x[j + D / 2] = b * std::cos(ang) + a * std::sin(ang);
+        }
+    };
+    Rng rng(4242);
+    auto bfr = [](float x) {
+        const uint32_t u = uint32_t(bf16_rne(x)) << 16;
+        float f;
+        std::memcpy(&f, &u, 4);
+        return f;
+    };
+    std::vector<float> koff(size_t(Hk * D));
+    for (float &x : koff) x = rng.uni();  // per-channel offsets, as real keys have
+    std::vector<float> tk(size_t(slots * mp * page * Hk * D)), tv(tk.size());  // what each (slot, position) holds
+    std::vector<int32_t> len(slots, 0);
+    struct Step {
+        const char *name;
+        std::vector<std::array<int32_t, 2>> rows;  // (slot, position), the planner's order
+        int64_t n_dec;
+        std::vector<int32_t> segs;  // (first row, count, first position, slot)
+    };
+    auto run_rows = [](int32_t slot, int32_t p0, int32_t n) {
+        std::vector<std::array<int32_t, 2>> v;
+        for (int32_t i = 0; i < n; ++i) v.push_back({slot, p0 + i});
+        return v;
+    };
+    auto cat = [](std::vector<std::array<int32_t, 2>> a, const std::vector<std::array<int32_t, 2>> &b) {
+        a.insert(a.end(), b.begin(), b.end());
+        return a;
+    };
+    std::vector<Step> steps;
+    steps.push_back({"chunks + short prompt", cat(cat(run_rows(0, 0, 40), run_rows(1, 0, 21)), run_rows(2, 0, 10)), 0,
+                     {0, 40, 0, 0, 40, 21, 0, 1, 61, 10, 0, 2}});
+    steps.push_back({"decoding rows", {{0, 40}, {1, 21}, {2, 10}}, 3, {}});
+    steps.push_back({"drafts filling a page", cat({{1, 22}}, run_rows(0, 41, 7)), 1, {1, 7, 41, 0}});
+    steps.push_back({"drafts across a page", run_rows(1, 23, 13), 0, {0, 13, 23, 1}});
+    steps.push_back({"after a rollback", {{1, 28}}, 1, {}});
+    steps.push_back({"mixed", cat(cat({{2, 11}}, run_rows(0, 48, 52)), run_rows(1, 29, 12)), 1, {1, 52, 48, 0, 53, 12, 29, 1}});
+    steps.push_back({"decoding rows again", {{0, 100}, {1, 41}, {2, 12}}, 3, {}});
+    const float scale = 1.0f / std::sqrt(float(D));
+    for (const Step &st : steps) {
+        const std::string name = std::string("kv4/") + st.name;
+        try {
+            const int64_t N = int64_t(st.rows.size()), n_segs = int64_t(st.segs.size() / 4);
+            std::vector<int32_t> sl(static_cast<size_t>(N)), ps(static_cast<size_t>(N));
+            int32_t max_pos = 0;
+            for (int64_t i = 0; i < N; ++i) sl[size_t(i)] = st.rows[size_t(i)][0], ps[size_t(i)] = st.rows[size_t(i)][1], max_pos = std::max(max_pos, ps[size_t(i)]);
+            std::vector<float> q(size_t(N * Hq * D)), k(size_t(N * Hk * D)), v(k.size());
+            for (float &x : q) x = 3.0f * rng.uni();
+            for (size_t i = 0; i < k.size(); ++i) k[i] = bfr(koff[i % size_t(Hk * D)] + 0.5f * rng.uni()), v[i] = bfr(rng.uni());
+            std::vector<float> qrot = q, krot = k;  // what the kernels see: rotated (keys in bf16 rows)
+            for (int64_t i = 0; i < N; ++i) {
+                for (int64_t h = 0; h < Hq; ++h) rope(qrot.data() + (i * Hq + h) * D, ps[size_t(i)]);
+                for (int64_t h = 0; h < Hk; ++h) {
+                    float *kr = krot.data() + (i * Hk + h) * D;
+                    rope(kr, ps[size_t(i)]);
+                    for (int64_t d = 0; d < D; ++d) kr[d] = bfr(kr[d]);
+                }
+            }
+            std::vector<int32_t> tiles;
+            for (int64_t j = 0; j < n_segs; ++j)
+                for (int32_t i = 0; i < st.segs[size_t(4 * j + 1)]; i += 16)
+                    tiles.push_back(st.segs[size_t(4 * j)] + i), tiles.push_back(std::min(16, st.segs[size_t(4 * j + 1)] - i));
+            float *qd = ar.up(q);
+            const int32_t *sd = ar.up(sl), *pd = ar.up(ps), *td = ar.up(tiles.empty() ? std::vector<int32_t>{0} : tiles);
+            float *o = static_cast<float *>(ar.zeros(sizeof(float) * size_t(N * Hq * D)));
+            gpu.set_exact_activations(false);
+            if (!gpu.qk_rope_append(qd, ar.up(k), ar.up(v), kp, vp, DType::KV4, nullptr, nullptr, 1e-6f, invd, sd, pd, ptd, mp, page, N, Hq,
+                                    Hk, D))
+                throw std::runtime_error("no fused append");
+            const int done = gpu.gqa_prefill(o, qd, kp, vp, DType::KV4, td, int64_t(tiles.size() / 2), n_segs ? st.segs.data() : nullptr,
+                                             n_segs, st.n_dec, true, sd, pd, ptd, mp, page, Hq, Hk, D, max_pos, scale);
+            gpu.set_exact_activations(true);
+            if (done != 2) throw std::runtime_error("gqa_prefill left rows");
+            const auto got = ar.down(o, size_t(N * Hq * D));
+            const auto kh = ar.down(kp, pool_bytes), vh = ar.down(vp, pool_bytes);
+            for (int64_t i = 0; i < N; ++i) {
+                const int32_t s2 = sl[size_t(i)], p = ps[size_t(i)];
+                for (int64_t h = 0; h < Hk; ++h)
+                    for (int64_t d = 0; d < D; ++d) {
+                        const size_t o2 = (size_t(s2 * mp * page + p) * Hk + size_t(h)) * D + size_t(d);
+                        tk[o2] = krot[size_t((i * Hk + h) * D + d)], tv[o2] = v[size_t((i * Hk + h) * D + d)];
+                    }
+                len[size_t(s2)] = std::max(len[size_t(s2)], p + 1);
+            }
+            // side_last: each slot's last row's page
+            std::vector<int32_t> side(slots);
+            std::memcpy(side.data(), kh.data() + ro, sizeof(int32_t) * slots);
+            for (int64_t i = 0; i < N; ++i)
+                if (i + 1 == N || sl[size_t(i + 1)] != sl[size_t(i)] || ps[size_t(i + 1)] != ps[size_t(i)] + 1)
+                    if (side[size_t(sl[size_t(i)])] != ps[size_t(i)] / page) throw std::runtime_error("side_last differs");
+            // the staged span: from the first segment longer than a page to the last
+            int64_t r0 = -1, r1 = -1;
+            for (int64_t j = 0; j < n_segs; ++j)
+                if (st.segs[size_t(4 * j + 1)] > page) {
+                    if (r0 < 0) r0 = st.segs[size_t(4 * j)];
+                    r1 = st.segs[size_t(4 * j)] + st.segs[size_t(4 * j + 1)];
+                }
+            // the values row i sees at (slot, position x), head h: the ring or the pool
+            auto seen = [&](int64_t i, int32_t s2, int32_t x, int64_t h, float *kx, float *vx) {
+                const int32_t p = ps[size_t(i)], lp = x / int32_t(page), rr = x % int32_t(page);
+                const bool staged = i >= r0 && i < r1;
+                const bool ring = staged ? lp == side[size_t(s2)] : (lp == p / int32_t(page) && lp >= side[size_t(s2)] - 1);
+                if (ring) {
+                    const uint8_t *ke = kh.data() + ro + kv4_side(s2, lp & 1, h, Hk), *ve = vh.data() + ro + kv4_side(s2, lp & 1, h, Hk);
+                    for (int c = 0; c < D; ++c) kx[c] = kv4_f16(kv4_ld16(ke + 2 * kv4_kside(rr, c))), vx[c] = kv4_f16(kv4_ld16(ve + 2 * kv4_vside(rr, c)));
+                } else {
+                    const int64_t pg = pt[size_t(s2 * mp + lp)];
+                    const uint8_t *kb = kh.data() + (pg * Hk + h) * kKv4Block, *vb = vh.data() + (pg * Hk + h) * kKv4Block;
+                    for (int c = 0; c < D; ++c) kx[c] = kv4_key(kb, vb, rr, c), vx[c] = kv4_value_rot(kb, vb, rr, c);
+                }
+                kv4_hadamard(vx);
+            };
+            std::vector<float> ref(size_t(N * Hq * D), 0.0f);
+            std::vector<float> kx(D), vx(D);
+            for (int64_t i = 0; i < N; ++i) {
+                const int32_t s2 = sl[size_t(i)], p = ps[size_t(i)];
+                for (int64_t h = 0; h < Hk; ++h) {
+                    std::vector<float> K(size_t((p + 1) * D)), V(K.size());
+                    for (int32_t x = 0; x <= p; ++x) {
+                        seen(i, s2, x, h, kx.data(), vx.data());
+                        std::copy(kx.begin(), kx.end(), K.begin() + x * D), std::copy(vx.begin(), vx.end(), V.begin() + x * D);
+                    }
+                    for (int64_t gq = 0; gq < G; ++gq) {
+                        const float *qr = qrot.data() + (i * Hq + h * G + gq) * D;
+                        std::vector<double> sc(size_t(p + 1));
+                        double mx = -1e300, l = 0.0;
+                        for (int32_t x = 0; x <= p; ++x) {
+                            double a = 0.0;
+                            for (int c = 0; c < D; ++c) a += double(qr[c]) * K[size_t(x * D + c)];
+                            sc[size_t(x)] = a * scale, mx = std::max(mx, sc[size_t(x)]);
+                        }
+                        for (auto &x2 : sc) x2 = std::exp(x2 - mx), l += x2;
+                        float *orow = ref.data() + (i * Hq + h * G + gq) * D;
+                        for (int32_t x = 0; x <= p; ++x)
+                            for (int c = 0; c < D; ++c) orow[c] += float(sc[size_t(x)] / l * V[size_t(x * D + c)]);
+                    }
+                }
+            }
+            compare(r, name, ref, got, 2e-2);
+        } catch (const std::exception &e) {
+            gpu.set_exact_activations(true);
+            r.error(name, e.what());
+            return;
+        }
+    }
+    // the quantiser: every page each slot has filled, decoded, against what was written
+    try {
+        const auto kh = ar.down(kp, pool_bytes), vh = ar.down(vp, pool_bytes);
+        std::vector<float> rk, gk, rv, gv;
+        for (int64_t s2 = 0; s2 < slots; ++s2)
+            for (int64_t lp = 0; lp < len[size_t(s2)] / page; ++lp)
+                for (int64_t h = 0; h < Hk; ++h) {
+                    const int64_t pg = pt[size_t(s2 * mp + lp)];
+                    const uint8_t *kb = kh.data() + (pg * Hk + h) * kKv4Block, *vb = vh.data() + (pg * Hk + h) * kKv4Block;
+                    for (int rr = 0; rr < page; ++rr) {
+                        float vr[D];
+                        for (int c = 0; c < D; ++c) vr[c] = kv4_value_rot(kb, vb, rr, c);
+                        kv4_hadamard(vr);
+                        for (int c = 0; c < D; ++c) {
+                            const size_t o2 = (size_t(s2 * mp * page + lp * page + rr) * Hk + size_t(h)) * D + size_t(c);
+                            rk.push_back(tk[o2]), gk.push_back(kv4_key(kb, vb, rr, c)), rv.push_back(tv[o2]), gv.push_back(vr[c]);
+                        }
+                    }
+                }
+        compare(r, "kv4/quantised keys (int4 per channel over a page)", rk, gk, 0.1);
+        compare(r, "kv4/quantised values (rotated, int4 per position)", rv, gv, 0.5);  // random values: amax / 14 a value, spread back by the rotation
+    } catch (const std::exception &e) {
+        r.error("kv4/quantiser", e.what());
+    }
+}
 
 void test_lora(Report &r, Backend &cpu, Backend &gpu) {
     Rng rng(4321);
@@ -2438,7 +2729,7 @@ int conformance(const char *subject_name, const char *reference_name, int32_t de
     if (fam & FAM_MLA) test_mla(r, *cpu, *gpu), test_mla_invariance(r, *cpu, *gpu), test_mla_prefill(r, *cpu, *gpu);
     else skipped += " mla";
     test_add_rmsnorm(r, *cpu, *gpu);
-    if (fam & FAM_GQA) test_dense_attention(r, *cpu, *gpu, small_on.get());
+    if (fam & FAM_GQA) test_dense_attention(r, *cpu, *gpu, small_on.get()), test_kv4(r, *gpu);
     else skipped += " gqa";
     test_gemm_group(r, *cpu, *gpu);
     test_bf16_activations(r, *cpu, *gpu);
