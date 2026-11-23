@@ -583,6 +583,7 @@ extern "C" {
     fn sk_exec_page_state_enable(e: *mut SkExec, err: *mut c_char, n: i32) -> i32;
     fn sk_exec_set_ink2_mtp(e: *mut SkExec, cfg: *const Ink2Mtp, err: *mut c_char, n: i32) -> i32;
     fn sk_exec_ink2_has_draft(e: *const SkExec) -> i32;
+    fn sk_exec_ink2_int8(e: *mut SkExec, dense: i32, head: i32, err: *mut c_char, n: i32) -> i32;
     #[allow(clippy::too_many_arguments)]
     fn sk_exec_ink2_draft(
         e: *mut SkExec,
@@ -1394,6 +1395,14 @@ impl Executor {
     pub fn set_ink2_mtp(&mut self, cfg: &Ink2Mtp) -> Result<(), String> {
         let mut err = err_buf();
         let rc = unsafe { sk_exec_set_ink2_mtp(self.raw.as_ptr(), cfg, err.as_mut_ptr(), ERR_LEN as i32) };
+        Self::check(rc, &err)
+    }
+
+    /// Before `finalize`: Inkling 2's dense matrices (`dense`: the layers' projections and routers;
+    /// `head`: the lm_head) as int8 with a scale per row. The GPU path's.
+    pub fn ink2_int8(&mut self, dense: bool, head: bool) -> Result<(), String> {
+        let mut err = err_buf();
+        let rc = unsafe { sk_exec_ink2_int8(self.raw.as_ptr(), dense as i32, head as i32, err.as_mut_ptr(), ERR_LEN as i32) };
         Self::check(rc, &err)
     }
 

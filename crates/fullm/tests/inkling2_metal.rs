@@ -19,10 +19,16 @@ fn fixture() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/tiny_inkling2")
 }
 
+/// The dense matrices as int8 (`--trunk int8 --head int8`) in the loads that follow.
+static INT8: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn load() -> Box<dyn Model> {
     // the oracle's checks with an f32 cache as well as f32 activations; else the default, half
     let f32 = std::env::var("FULLM_INK2_METAL_F32").is_ok_and(|v| v == "1");
+    let int8 = INT8.load(std::sync::atomic::Ordering::Relaxed);
     let opts = LoadOptions {
+        trunk: if int8 { fullm::tensor::Precision::Int8 } else { fullm::tensor::Precision::Bf16 },
+        head: int8.then_some(fullm::tensor::Precision::Int8),
         kv_dtype: if f32 { fullm::models::CacheDtype::F32 } else { fullm::models::CacheDtype::Auto },
         max_seqs: 2,
         cache_tokens: 256,
@@ -257,6 +263,11 @@ fn the_gpu_steps_match_the_oracle() {
     // the values of runs of 4 rows or more by MPS (in serving: from 32)
     std::env::set_var("FULLM_INK2_METAL_PV_MIN", "4");
     check(2e-3, true);
+    // int8 matrices (a scale per row): as with half activations below, the tiny model turns the
+    // rounding into whole units of logit, so only that every path runs and stays finite
+    INT8.store(true, std::sync::atomic::Ordering::Relaxed);
+    check(f32::MAX, false);
+    INT8.store(false, std::sync::atomic::Ordering::Relaxed);
     // half activations: the tiny model's logits move by whole units (see above), so only that
     // every path runs and stays finite; the real model's text is checked against the CPU path
     std::env::set_var("FULLM_INK2_METAL_F32", "0");

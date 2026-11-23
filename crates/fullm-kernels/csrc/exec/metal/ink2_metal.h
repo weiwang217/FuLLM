@@ -99,6 +99,10 @@ struct Ink2MetalModel {
     // null, or [page][vis_off.back()] floats: the histories after each page's last position, laid
     // out as a slot's (the prefix cache starts sequences from them)
     float *tails = nullptr;
+    // int8 codes with a scale per row in place of bf16, half the bytes a step reads: the layers'
+    // projections and routers (q, k, v, o, the output gate, the relative bias); the lm_head. Their
+    // bf16 memory is freed by ink2_metal_setup: the pointers above then only name them.
+    bool w8_dense = false, w8_head = false;
 };
 
 // The model for ink2_metal_step. False (why) when a shape is outside what the kernels take: the

@@ -366,6 +366,7 @@ public:
     virtual void drop_tail(int32_t, int32_t) {}
     virtual void set_ink2_mtp(const sk_ink2_mtp &) { throw std::runtime_error("this executor has no draft head"); }
     virtual bool ink2_has_draft() const { return false; }
+    virtual void ink2_int8(bool, bool) { throw std::runtime_error("this executor has no int8 matrices of its own"); }
     virtual void ink2_draft(int32_t, const int32_t *, const int32_t *, const int32_t *, const int32_t *, int32_t, int32_t *, float *) {
         throw std::runtime_error("this executor has no draft head");
     }

@@ -1597,6 +1597,7 @@ int sk_exec_load_slot(sk_exec *e, int32_t slot, const void *src, char *err, int 
 
 int sk_exec_drop_tail(sk_exec *e, int32_t slot, int32_t n, char *err, int err_len) { SK_TRY(e->ex->drop_tail(slot, n)) }
 int sk_exec_set_ink2_mtp(sk_exec *e, const sk_ink2_mtp *cfg, char *err, int err_len) { SK_TRY(e->ex->set_ink2_mtp(*cfg)) }
+int sk_exec_ink2_int8(sk_exec *e, int dense, int head, char *err, int err_len) { SK_TRY(e->ex->ink2_int8(dense != 0, head != 0)) }
 int sk_exec_ink2_has_draft(const sk_exec *e) { return e->ex->ink2_has_draft() ? 1 : 0; }
 int sk_exec_ink2_draft(sk_exec *e, int32_t n, const int32_t *slots, const int32_t *next, const int32_t *pos,
                        const int32_t *page_table, int32_t k, int32_t *out, float *conf, char *err, int err_len) {

@@ -195,6 +195,10 @@ typedef struct {
     uint8_t local[8];
 } sk_ink2_mtp;
 int sk_exec_set_ink2_mtp(sk_exec *e, const sk_ink2_mtp *cfg, char *err, int err_len);
+/* Before finalize: the dense matrices (dense: every layer's projections and router; head: the
+ * lm_head) are held as int8 with a scale per row instead of bf16, half the bytes a token reads.
+ * The GPU path's; finalize fails when the model stays on the CPU. */
+int sk_exec_ink2_int8(sk_exec *e, int dense, int head, char *err, int err_len);
 /* Whether the head drafts (after finalize). */
 int sk_exec_ink2_has_draft(const sk_exec *e);
 /* After a step (and its sk_exec_drop_tail calls): up to k (< block) drafts for each of n sequences

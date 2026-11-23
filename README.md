@@ -31,7 +31,7 @@ It serves an OpenAI-compatible API with these features:
 | Qwen3-30B-A3B (MoE) | experts bf16 / fp8b / int8 / int4, GPTQ int4 checkpoints; KV bf16 / fp8 / int4 | for agents: fp8b experts + bf16 KV |
 | Kimi Linear 48B-A3B (KDA + MLA hybrid) | experts bf16 / fp8b / int8 / int4 | in HBM at 8 bits or below; HBM / CPU split at bf16 |
 | Kimi K3 | MXFP4 experts in DRAM | the first layers verified against a reference; full model needs a large host |
-| Inkling 2 Mini (looped MoE) | experts as released (NVFP4 / MXFP8), read in place; KV half / f32 | Apple GPU (Metal) and CPU; its draft head, prefix cache, tool calls |
+| Inkling 2 Mini (looped MoE) | experts as released (NVFP4 / MXFP8), read in place; dense matrices bf16 / int8; KV half / f32 | Apple GPU (Metal) and CPU; its draft head, prefix cache, tool calls |
 
 ## Architecture
 
@@ -113,9 +113,10 @@ fullm serve --model /data/qwen3-8b --backend cuda --lora sql=/data/lora-sql --lo
 # CPU backend (e.g. on a Mac)
 fullm serve --model /data/qwen3-0.6b --backend cpu --max-seqs 8 --served-name qwen3 --port 8000
 
-# Inkling 2 Mini on a Mac: the steps run on the Apple GPU; drafts from the model's own head
+# Inkling 2 Mini on a Mac: the steps run on the Apple GPU; drafts from the model's own head;
+# the dense matrices as int8 (leave --trunk and --head out to keep them bf16, as released)
 fullm serve --model ~/models/inkling2-mini --backend cpu --step-tokens 1024 --page 16 --cache-tokens 8192 \
-  --spec-tokens 7 --spec-eagle-tokens 7 --port 8000
+  --trunk int8 --head int8 --spec-tokens 7 --spec-eagle-tokens 7 --port 8000
 ```
 
 Useful flags:
@@ -125,7 +126,8 @@ Useful flags:
 | `--gpu-expert-format bf16\|fp8b\|int8\|fp8\|int4` | the resident experts' format |
 | `--gpu-experts auto\|off\|GB` | how many experts live in GPU memory |
 | `--kv-dtype bf16\|fp8\|fp8-token\|int4` | the KV cache's format; `int4` is for servers limited by cache size (more users or longer contexts than `fp8` can hold): it holds 1.5x `fp8`'s positions and is slower than `fp8` when `fp8` already fits |
-| `--trunk bf16\|fp8\|int8` | the dense matrices' format |
+| `--trunk bf16\|fp8\|int8` | the dense matrices' format (Inkling 2: bf16 or int8) |
+| `--head bf16\|fp8\|int8` | the lm_head's format (Inkling 2: bf16 or int8) |
 | `--step-tokens` | the token budget of a step |
 | `--decode-share S` `--mixed-step-tokens N` | while a request is writing, another request's prompt is read N tokens at a time and the writers get the share S of the time (off by default: prompts are read at the full step budget) |
 | `--spec-model DIR` | an EAGLE-3 head (n-gram drafts are on by default on GPUs) |
@@ -280,40 +282,61 @@ context gets its first token in 116 ms. With the default settings a 1M-token win
 
 Inkling 2 Mini (26B, 128 routed experts, 20 GB as released) on an M3 Pro with 36 GB, both engines on
 the Apple GPU. Ollama 0.40.17 runs the model on MLX and drafts with the model's own head, as FuLLM
-does here. One request at a time, streamed, temperature 0, the same chat prompts with the same
-token counts on both sides (2026-11-22).
+does here. FuLLM with `--trunk int8 --head int8`: the dense matrices (2.6 of the 5.4 GB a token
+reads, and the 0.9 GB lm_head) as int8 with a scale per row, where Ollama keeps them bf16; the
+experts are 4 and 8 bits as released on both sides. With int8 the replies are not the bf16 ones
+token for token; `tools/agent_loop.py` (14 / 14 simple tasks, 6 / 6 complex flows, no protocol
+errors) and `tools/smoke_test.py` (55 / 61 against 54 / 61) give the same results as bf16. Streamed,
+temperature 0, the same chat prompts with the same token counts on both sides (2026-11-22).
 
-Sixteen prompts, 250 tokens each: eight with a context of 700 to 2700 tokens (summaries,
-extraction, translation, code review) and eight short ones (questions, a story, code, Chinese):
+One request at a time. Sixteen prompts, 250 tokens each: eight with a context of 700 to 2700 tokens
+(summaries, extraction, translation, code review) and eight short ones (questions, a story, code,
+Chinese):
 
-| measurement | FuLLM | Ollama | FuLLM vs Ollama |
+| measurement | FuLLM, int8 | Ollama | FuLLM vs Ollama |
 |---|---|---|---|
-| time to first token, prompts with a context (median ratio) | 3.1 to 11.9 s | 4.0 to 16.4 s | 1.27x sooner |
-| time to first token, short prompts (median ratio) | 0.44 to 0.70 s | 0.71 to 1.14 s | 1.46x sooner |
-| decode, all 4000 tokens | 18.0 tok/s | 17.4 tok/s | +3% |
-| all sixteen requests, end to end | 291 s | 323 s | 10% less |
+| time to first token, prompts with a context (median ratio) | 3.1 to 11.9 s | 4.2 to 16.1 s | 1.33x sooner |
+| time to first token, short prompts (median ratio) | 0.42 to 0.61 s | 0.71 to 1.17 s | 1.56x sooner |
+| decode, all 4000 tokens | 21.1 tok/s | 16.8 tok/s | +26% |
+| all sixteen requests, end to end | 257 s | 329 s | 22% less |
 
-The first token came sooner on all sixteen. Decoding was faster on eleven and slower on five: both
-engines verify drafts, and the rate follows how many of them the text being written lets them
-keep (translation 29 tok/s, free writing 14 to 15).
+The first token came sooner and decoding was faster on all sixteen (decode 1.01x to 1.67x, median
+1.25x): both engines verify drafts, and the rate follows how many of them the text being written
+lets them keep (translation 31 tok/s, free writing 16 to 18).
 
-A 2938-token prompt gets its first token in 12.6 s (Ollama 16.3 s) and the whole request with 200
-generated tokens takes 24.0 s (27.4 s).
+A 2938-token prompt gets its first token in 12.1 s (Ollama 16.1 s) and the whole request with 200
+generated tokens takes 21.1 s (26.5 s); asked again, 9.3 s (10.9 s).
 
 Several requests at once (`tools/bench_openai.py`, 200 tokens each; Ollama as installed, which takes
 them one at a time, FuLLM with `--max-seqs 8`):
 
-| short prompts, c = 1 / 2 / 4 / 8 | FuLLM | Ollama | FuLLM / Ollama |
+| short prompts, c = 1 / 2 / 4 / 8 | FuLLM, int8 | Ollama | FuLLM / Ollama |
 |---|---|---|---|
-| aggregate tok/s | 14.8 / 18.8 / 24.1 / 32.7 | 13.5 / 13.8 / 13.9 / 13.4 | 1.1 / 1.4 / 1.7 / 2.4x |
-| time to first token, median | 0.7 / 0.9 / 1.1 / 1.8 s | 1.1 / 8.4 / 21.6 / 51.2 s | 1.5 / 9.6 / 19 / 28x sooner |
+| aggregate tok/s | 17.6 / 21.6 / 27.0 / 34.5 | 13.2 / 14.0 / 13.8 / 13.4 | 1.3 / 1.5 / 2.0 / 2.6x |
+| time to first token, median | 0.7 / 0.9 / 1.1 / 1.8 s | 1.1 / 8.3 / 22.4 / 51.9 s | 1.6 / 9.5 / 20 / 28x sooner |
 
-With a 1000-word context before each prompt, at c = 2 / 4: 8.9 / 11.0 tok/s aggregate (Ollama 8.6 /
-7.9) and a median first token after 17.3 / 27.6 s (22.9 / 51.1 s).
+With a 1000-word context before each prompt, at c = 1 / 2 / 4: 9.6 / 11.5 / 12.1 tok/s aggregate
+(Ollama 9.0 / 9.0 / 8.5) and a median first token after 8.4 / 14.5 / 25.6 s (10.2 / 21.7 / 46.5 s).
+
+What int8 changes, FuLLM against itself and Ollama in the same hour:
+
+| measurement | FuLLM, int8 | FuLLM, bf16 | Ollama (bf16) |
+|---|---|---|---|
+| sixteen prompts: decode | 21.1 tok/s | 18.0 tok/s | 16.8 tok/s |
+| sixteen prompts: a step | 105 ms | 118 ms | |
+| sixteen prompts: end to end | 257 s | 289 s | 329 s |
+| 2938-token prompt: first token | 12.1 s | 12.5 s | 16.1 s |
+| short prompts, c = 1 / 2 / 4 / 8: aggregate tok/s | 17.6 / 21.6 / 27.0 / 34.5 | 15.8 / 19.4 / 23.9 / 32.1 | 13.2 / 14.0 / 13.8 / 13.4 |
+| 1000-word context, c = 2 / 4: aggregate tok/s | 11.5 / 12.1 | 9.6 / 10.9 | 9.0 / 8.5 |
+
+int8 decodes 17% faster than bf16 on the sixteen prompts (a step is 10% shorter; the rest is text
+that kept more drafts) and 7% to 20% faster with several requests; the first token of a prompt
+barely moves.
 
 By default a prompt that arrives is read at the full step budget, and a request that is writing
 waits for each of those steps. `--decode-share 0.9 --mixed-step-tokens 256` reads it in 256-token
-steps and gives the writers 90% of the time between them. With those flags, a request with a
+steps and gives the writers 90% of the time between them. With those flags (measured with bf16
+matrices), a request with a
 2000-token context that arrives while another one is writing 300 tokens gets its first token after
 25.9 s (Ollama 28.0 to 29.3 s) and both are done after 33.2 s (35.2 to 35.6 s); two requests with a
 1000-word context that arrive together get their first tokens after 9.4 and 28.8 s (11.7 and

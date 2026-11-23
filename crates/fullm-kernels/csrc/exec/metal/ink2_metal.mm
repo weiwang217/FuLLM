@@ -102,6 +102,41 @@ kernel void gemmc(constant P &p [[buffer(0)]], device const uint *w [[buffer(1)]
     const uint o = ((gid.z * p.a[3] + gid.x) * p.a[1] + gid.y) * TT;
     for (uint t = 0; t < TT; ++t) part[o + t] = acc[t];
 }
+// The same two with W as int8 and a scale per matrix row (W[n][k] = sc[n] * w[n][k]): half the
+// bytes of bf16 to read. The codes are exact in half.
+kernel void gemm8(constant P &p [[buffer(0)]], device const uint *w [[buffer(1)]], device const ACT4 *x [[buffer(2)]],
+                  device float *y [[buffer(3)]], device const float *sc [[buffer(4)]], uint2 gid [[thread_position_in_grid]]) {
+    const uint K4 = p.a[0] / 4, ldy = p.a[1], N = p.a[2], s = gid.y * TT, wo = gid.x * K4;
+    float acc[TT];
+    for (uint t = 0; t < TT; ++t) acc[t] = 0.0f;
+    for (uint i = 0; i < K4; ++i) {
+        const ACT4 wv = ACT4(as_type<char4>(w[wo + i]));
+        const uint xo = s * K4 + i;
+        for (uint t = 0; t < TT; ++t) {
+            const float4 pr = float4(wv * x[xo + t * K4]);
+            acc[t] += (pr.x + pr.y) + (pr.z + pr.w);
+        }
+    }
+    const uint m = min(uint(TT), N - s);
+    const float cap = p.f[0], f = sc[gid.x];
+    for (uint t = 0; t < m; ++t) y[(s + t) * ldy + gid.x] = cap > 0.0f ? tanh(acc[t] * f / cap) * cap : acc[t] * f;
+}
+kernel void gemmc8(constant P &p [[buffer(0)]], device const uint *w [[buffer(1)]], device const ACT4 *x [[buffer(2)]],
+                   device float *part [[buffer(3)]], device const float *sc [[buffer(4)]], uint3 gid [[thread_position_in_grid]]) {
+    const uint K4 = p.a[0] / 4, c0 = gid.y * 64, c1 = min(K4, c0 + 64), wo = gid.x * K4, xb = gid.z * TT * K4;
+    float acc[TT];
+    for (uint t = 0; t < TT; ++t) acc[t] = 0.0f;
+    for (uint i = c0; i < c1; ++i) {
+        const ACT4 wv = ACT4(as_type<char4>(w[wo + i]));
+        for (uint t = 0; t < TT; ++t) {
+            const float4 pr = float4(wv * x[xb + i + t * K4]);
+            acc[t] += (pr.x + pr.y) + (pr.z + pr.w);
+        }
+    }
+    const uint o = ((gid.z * p.a[3] + gid.x) * p.a[1] + gid.y) * TT;
+    const float f = sc[gid.x];
+    for (uint t = 0; t < TT; ++t) part[o + t] = acc[t] * f;
+}
 // y[r][n] = the sum of row n's chunks for activation row r: thread (n, r). a[1]: nc, a[2]: ldy,
 // a[3]: rows; f0: softcap
 kernel void gsumt(constant P &p [[buffer(0)]], device const float *part [[buffer(1)]], device float *y [[buffer(2)]],
@@ -947,6 +982,8 @@ struct Ink2Metal {
     id<MTLBuffer> lut = nil;
     Ink2MetalModel M;
     bool ready = false;
+    // matrices held as int8 with a scale per row (Ink2MetalModel::w8_*): the bf16's address -> (codes, scales)
+    std::map<const void *, std::pair<const void *, const float *>> w8;
     // the step being encoded
     id<MTLCommandBuffer> cb = nil;
     id<MTLComputeCommandEncoder> enc = nil;
@@ -1109,7 +1146,10 @@ struct Step {
     void gemm(const void *w, int64_t rows, int64_t cols, BR x, BR y, int64_t n, float cap = 0.0f) {
         PC p;
         p.a[0] = uint32_t(cols), p.a[1] = uint32_t(rows), p.a[2] = uint32_t(n), p.f[0] = cap;
-        BR W = ref(m, w, size_t(rows * cols) * 2);
+        const auto q = m->w8.find(w);
+        const bool w8 = q != m->w8.end();
+        BR W = w8 ? ref(m, q->second.first, size_t(rows * cols)) : ref(m, w, size_t(rows * cols) * 2);
+        BR sc = w8 ? ref(m, q->second.second, size_t(rows) * 4) : W;
         if (n == 1 || (n <= 64 && rows < 16384)) {
             // a few tiles: chunks of the columns, then their sums. (For a lone row, one thread a
             // whole matrix row was 10% slower even for the 3072-row matrices; for 2 to 64 rows the
@@ -1118,11 +1158,13 @@ struct Step {
             const int64_t nc = (cols + 255) / 256, tiles = (n + t - 1) / t;
             BR part = sb(m, "gemm_part", size_t(tiles * rows * nc * t) * 4);
             p.a[1] = uint32_t(nc), p.a[2] = uint32_t(rows), p.a[3] = uint32_t(rows);
-            run(m, pipe(m, "gemmc", t), p, {W, x, part}, NSUInteger(rows), NSUInteger(nc), NSUInteger(tiles));
+            if (w8) run(m, pipe(m, "gemmc8", t), p, {W, x, part, sc}, NSUInteger(rows), NSUInteger(nc), NSUInteger(tiles));
+            else run(m, pipe(m, "gemmc", t), p, {W, x, part}, NSUInteger(rows), NSUInteger(nc), NSUInteger(tiles));
             run(m, pipe(m, "gsumt", t), p, {part, y}, NSUInteger(rows), NSUInteger(n));
             return;
         }
-        run(m, pipe(m, "gemm", 16), p, {W, x, y}, NSUInteger(rows), NSUInteger((n + 15) / 16));
+        if (w8) run(m, pipe(m, "gemm8", 16), p, {W, x, y, sc}, NSUInteger(rows), NSUInteger((n + 15) / 16));
+        else run(m, pipe(m, "gemm", 16), p, {W, x, y}, NSUInteger(rows), NSUInteger((n + 15) / 16));
     }
 
     BR vec(const float *p, int64_t n) { return ref(m, p, size_t(n) * 4); }
@@ -1512,7 +1554,7 @@ Ink2Metal *ink2_metal_create(bool f32_act, bool f32_kv, std::string &why) {
                                             "mk_gate", "mk_max1", "mk_max2", "kvstore", "sm_a", "sm_b", "sm_den",
                                             "kv_gather", "ogate", "pv1", "pv2", "route_rank", "route_wt", "xcount", "xprefix", "xstart", "xslot", "pairs", "rowgather",
                                             "glu", "combine"};
-        static const char *const tiled[] = {"gemm", "gemmc", "gsumt", "attn_qk", "xrows_nv", "xrows_mx", "xrows_nv_b", "xrows_mx_b"};
+        static const char *const tiled[] = {"gemm", "gemmc", "gemm8", "gemmc8", "gsumt", "attn_qk", "xrows_nv", "xrows_mx", "xrows_nv_b", "xrows_mx_b"};
         bool ok = m->queue != nil;
         for (int ti = 0; ti < 6 && ok; ++ti) {
             MTLCompileOptions *opt = [MTLCompileOptions new];
@@ -1592,6 +1634,36 @@ bool ink2_metal_add_layer(Ink2Metal *m, int layer, int fmt, int n_experts, int h
     }
 }
 
+// A bf16 matrix [rows][cols] as int8 codes with a scale per row (the row's largest magnitude is
+// 127); Step::gemm then reads those, and the bf16 (an ink2_metal_alloc of its own) is freed.
+static void quant8(Ink2Metal *m, const void *w, int64_t rows, int64_t cols) {
+    if (!w || m->w8.count(w)) return;
+    int8_t *q = static_cast<int8_t *>(ink2_metal_alloc(m, size_t(rows * cols)));
+    float *sc = static_cast<float *>(ink2_metal_alloc(m, size_t(rows) * 4));
+    if (!q || !sc) return;
+    const uint16_t *src = static_cast<const uint16_t *>(w);
+    dispatch_apply(size_t(rows), dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t r) {
+      const uint16_t *a = src + r * size_t(cols);
+      float mx = 0.0f;
+      for (int64_t c = 0; c < cols; ++c) {
+          const uint32_t u = uint32_t(a[c]) << 16;
+          float f;
+          std::memcpy(&f, &u, 4);
+          mx = std::max(mx, std::fabs(f));
+      }
+      const float s = mx > 0.0f ? mx / 127.0f : 1.0f, inv = 1.0f / s;
+      for (int64_t c = 0; c < cols; ++c) {
+          const uint32_t u = uint32_t(a[c]) << 16;
+          float f;
+          std::memcpy(&f, &u, 4);
+          q[r * size_t(cols) + size_t(c)] = int8_t(std::lrintf(f * inv));
+      }
+      sc[r] = s;
+    });
+    m->w8[w] = {q, sc};
+    m->allocs.erase(reinterpret_cast<uintptr_t>(w));
+}
+
 bool ink2_metal_setup(Ink2Metal *m, const Ink2MetalModel &M, std::string &why) {
     const sk_ink2_dims &d = M.d;
     auto bad = [&](const char *s) {
@@ -1606,6 +1678,13 @@ bool ink2_metal_setup(Ink2Metal *m, const Ink2MetalModel &M, std::string &why) {
     if (!M.conv || M.kpool.size() != M.vpool.size() || M.vis_off.empty()) return bad("no state");
     m->M = M;
     m->M.d.layer_sliding = nullptr;
+    if (M.w8_head) quant8(m, M.lm_head, d.out_vocab, d.hidden);
+    if (M.w8_dense)
+        for (const Ink2MetalLayer &L : M.layers) {
+            const int64_t H = d.hidden, Cq = int64_t(L.hq) * L.d, Ck = int64_t(L.hk) * L.d;
+            quant8(m, L.q, Cq, H), quant8(m, L.og, Cq, H), quant8(m, L.k, Ck, H), quant8(m, L.v, Ck, H);
+            quant8(m, L.o, H, Cq), quant8(m, L.rel, int64_t(L.hq) * d.d_rel, H), quant8(m, L.router, d.n_experts, H);
+        }
     m->ready = true;
     return true;
 }

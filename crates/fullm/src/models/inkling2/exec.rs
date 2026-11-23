@@ -17,6 +17,7 @@ use super::{Ink2Config, PREFIX};
 use crate::models::paged::{Geometry, Paged};
 use crate::models::{BackendKind, DraftReq, LoadOptions, Model};
 use crate::st::{Dtype, SafeTensors};
+use crate::tensor::Precision;
 
 pub struct Ink2Exec {
     cfg: Ink2Config,
@@ -401,6 +402,16 @@ impl Ink2Exec {
         std::hint::black_box(touched);
         if mlock && !locked_ok {
             tracing::warn!("could not wire the experts' pages (mlock failed: see ulimit -l); decoding will be slower");
+        }
+        // --trunk int8 / --head int8: the dense matrices as int8 with a scale per row (the GPU path)
+        let w8 = |p: Precision, flag: &str| match p {
+            Precision::Bf16 => Ok(false),
+            Precision::Int8 => Ok(true),
+            p => Err(anyhow!("{flag} {p:?}: Inkling 2's dense matrices are bf16 or int8")),
+        };
+        let (dense, head) = (w8(opts.trunk, "--trunk")?, w8(opts.head.unwrap_or(Precision::Bf16), "--head")?);
+        if dense || head {
+            ex.ink2_int8(dense, head).map_err(|e| anyhow!(e))?;
         }
         // FULLM_INK2_MTP=0: without the draft head
         if std::env::var("FULLM_INK2_MTP").map_or(true, |v| v != "0") {

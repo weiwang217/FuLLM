@@ -445,6 +445,8 @@ public:
         last_n_.assign(size_t(o_.n_slots), 0);
         last_kept_.assign(size_t(o_.n_slots), 0), last_first_.assign(size_t(o_.n_slots), 0), last_step_.assign(size_t(o_.n_slots), 0);
         setup_gpu();
+        if ((w8_dense_ || w8_head_) && !gpu_)
+            throw std::runtime_error("inkling2: int8 matrices are the GPU path's; this model stays on the CPU (--trunk bf16, no --head)");
         if (kv_half_ && !gpu_)
             throw std::runtime_error("inkling2: the 16-bit cache is the GPU path's; this model stays on the CPU (--kv-dtype f32)");
         logits_.resize(size_t(o_.max_rows) * d_.out_vocab);
@@ -476,6 +478,10 @@ public:
         mtp_ = c, mtp_set_ = true;
     }
     bool ink2_has_draft() const override { return mtp_on_; }
+    void ink2_int8(bool dense, bool head) override {
+        if (finalized_) throw std::runtime_error("ink2_int8 after finalize");
+        w8_dense_ = dense, w8_head_ = head;
+    }
 
     // Drafts after a step: see sk_exec_ink2_draft.
     void ink2_draft(int32_t n, const int32_t *slots, const int32_t *next, const int32_t *pos, const int32_t *page_table, int32_t k,
@@ -542,6 +548,9 @@ public:
            << double(weight_bytes_) / 1e9 << " GB, " << d_.n_experts << " experts top-" << d_.topk << " read in place ("
            << double(expert_bytes_) / 1e9 << " GB), KV cache " << double(kv_bytes_) / 1e9 << (kv_half_ ? " GB f16 (" : " GB f32 (")
            << int64_t(o_.n_pages) * o_.page << " positions), " << pool_->size() << " threads";
+        if (w8_dense_ || w8_head_)
+            os << ", int8 with a scale per row: " << (w8_dense_ ? "the layers' projections" : "") << (w8_dense_ && w8_head_ ? ", " : "")
+               << (w8_head_ ? "the lm_head" : "");
         if (mtp_on_) os << ", draft head (" << mtp_.n_layers << " layers, blocks of " << mtp_.block << ")";
         if (tails_)
             os << ", prefix cache: the histories kept by page (" << double(vis_off_.back()) * 4 / 1e6 << " MB a page, "
@@ -786,6 +795,7 @@ private:
         M.kpool = kpool_, M.vpool = vpool_, M.conv = conv_, M.vis_off = vis_off_;
         M.undo = undo_, M.undo_stride = int64_t(undo_stride_), M.undo_rows = kUndo;
         M.tails = tails_;
+        M.w8_dense = w8_dense_, M.w8_head = w8_head_;
         std::string head_why;
         if (mtp_set_ && !setup_mtp(M.mtp, head_why)) std::fprintf(stderr, "fullm: inkling2's draft head is not used (%s)\n", head_why.c_str());
         bool bf16 = lm_head_.fmt == WFmt::BF16;
@@ -1336,6 +1346,7 @@ private:
     size_t weight_bytes_ = 0, expert_bytes_ = 0, kv_bytes_ = 0;
 #if INK2_METAL
     Ink2Metal *metal_ = nullptr;
+    bool w8_dense_ = false, w8_head_ = false;  // int8 matrices on the GPU path (ink2_int8)
     bool gpu_ = false;      // steps run on it
     bool kv_half_ = false;  // the pools hold half (the GPU path only)
 #endif
